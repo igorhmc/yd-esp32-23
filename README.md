@@ -59,3 +59,21 @@ C:\Users\igorh\AppData\Local\Programs\Python\Python313\python.exe -m platformio 
 - API de estado: `GET /api/state`
 - API para mudar cor: `GET /api/led?hex=RRGGBB`
   - Exemplo: `http://esp32.local/api/led?hex=FF0000`
+
+## Matriz WS2812B 8x8
+Ligacao recomendada:
+- `VCC` da matriz -> `5V` do ESP32-S3
+- `GND` da matriz -> `GND` do ESP32-S3
+- `DIN` da matriz -> `GPIO14` do ESP32-S3
+- Resistor de `330R` em serie no fio de dados (`GPIO14` -> `DIN`)
+- Recomendado capacitor `1000uF` entre `5V` e `GND` perto da matriz
+
+Observacao de alimentacao:
+- Sim, para teste pode alimentar a matriz pelo `5V` da USB-C da propria placa.
+- Para brilho alto (muitos LEDs em branco forte), prefira fonte `5V` externa para a matriz.
+- Sempre mantenha `GND` comum entre fonte externa e ESP32.
+
+## APIs da matriz
+- Ajustar brilho: `GET /api/matrix?brightness=0..255`
+- Rodar teste visual: `GET /api/matrix?test=1`
+- Ajustar cor (equivalente ao LED): `GET /api/matrix?hex=RRGGBB`

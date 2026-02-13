@@ -1,3 +1,4 @@
+#include <Adafruit_NeoPixel.h>
 #include <Arduino.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
@@ -21,6 +22,24 @@
 #define DEVICE_HOSTNAME "esp32"
 #endif
 
+#ifndef MATRIX_DATA_PIN
+#define MATRIX_DATA_PIN 14
+#endif
+
+#ifndef MATRIX_WIDTH
+#define MATRIX_WIDTH 8
+#endif
+
+#ifndef MATRIX_HEIGHT
+#define MATRIX_HEIGHT 8
+#endif
+
+#ifndef MATRIX_BRIGHTNESS_DEFAULT
+#define MATRIX_BRIGHTNESS_DEFAULT 32
+#endif
+
+static const uint16_t kMatrixLedCount = MATRIX_WIDTH * MATRIX_HEIGHT;
+
 #ifdef LED_BUILTIN
 static const int kLedPin = LED_BUILTIN;
 #endif
@@ -39,7 +58,15 @@ struct RgbColor {
 };
 
 WebServer gWebServer(80);
+Adafruit_NeoPixel gMatrix(kMatrixLedCount, MATRIX_DATA_PIN, NEO_GRB + NEO_KHZ800);
+
 RgbColor gLedColor = {0, 0, 0};
+uint8_t gMatrixBrightness = MATRIX_BRIGHTNESS_DEFAULT;
+bool gMatrixReady = false;
+bool gMatrixTestRunning = false;
+uint16_t gMatrixTestIndex = 0;
+unsigned long gMatrixLastStepMs = 0;
+
 bool gMdnsStarted = false;
 bool gWebServerStarted = false;
 
@@ -82,12 +109,18 @@ void writeRgbAllPins(const RgbPinList &list, uint8_t r, uint8_t g, uint8_t b) {
   }
 }
 
-void applyLedColor(const RgbColor &color) {
+void applyBoardLedColor(const RgbColor &color) {
+  // Evita conflito de RMT quando a matriz WS2812 estiver ativa.
+  if (gMatrixReady) {
+    return;
+  }
+
   const RgbPinList rgbPins = buildRgbPinList();
   if (rgbPins.count > 0) {
     writeRgbAllPins(rgbPins, color.r, color.g, color.b);
     return;
   }
+
 #ifdef LED_BUILTIN
   const bool on = (color.r > 0 || color.g > 0 || color.b > 0);
   digitalWrite(kLedPin, on ? HIGH : LOW);
@@ -96,9 +129,31 @@ void applyLedColor(const RgbColor &color) {
 #endif
 }
 
+void applyMatrixSolidColor(const RgbColor &color) {
+  if (!gMatrixReady) {
+    return;
+  }
+
+  gMatrix.setBrightness(gMatrixBrightness);
+  const uint32_t packed = gMatrix.Color(color.r, color.g, color.b);
+  for (uint16_t i = 0; i < kMatrixLedCount; i++) {
+    gMatrix.setPixelColor(i, packed);
+  }
+  gMatrix.show();
+}
+
 void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
   gLedColor = {r, g, b};
-  applyLedColor(gLedColor);
+  gMatrixTestRunning = false;
+  applyBoardLedColor(gLedColor);
+  applyMatrixSolidColor(gLedColor);
+}
+
+void setMatrixBrightness(uint8_t value) {
+  gMatrixBrightness = value;
+  if (gMatrixReady && !gMatrixTestRunning) {
+    applyMatrixSolidColor(gLedColor);
+  }
 }
 
 String ledHexColor() {
@@ -128,7 +183,7 @@ bool parseHexColor(String hex, RgbColor &out) {
   return true;
 }
 
-void saveLedColor() {
+void saveSettings() {
   Preferences pref;
   if (!pref.begin("ledcfg", false)) {
     return;
@@ -136,25 +191,89 @@ void saveLedColor() {
   pref.putUChar("r", gLedColor.r);
   pref.putUChar("g", gLedColor.g);
   pref.putUChar("b", gLedColor.b);
+  pref.putUChar("br", gMatrixBrightness);
   pref.end();
 }
 
-void loadLedColor() {
+void loadSettings() {
   Preferences pref;
   if (!pref.begin("ledcfg", true)) {
     return;
   }
+
   const uint8_t r = pref.getUChar("r", 0);
   const uint8_t g = pref.getUChar("g", 0);
   const uint8_t b = pref.getUChar("b", 0);
+  const uint8_t br = pref.getUChar("br", MATRIX_BRIGHTNESS_DEFAULT);
   pref.end();
+
+  gMatrixBrightness = br;
   setLedColor(r, g, b);
+}
+
+uint32_t colorWheel(uint8_t pos) {
+  pos = 255 - pos;
+  if (pos < 85) {
+    return gMatrix.Color(255 - pos * 3, 0, pos * 3);
+  }
+  if (pos < 170) {
+    pos -= 85;
+    return gMatrix.Color(0, pos * 3, 255 - pos * 3);
+  }
+  pos -= 170;
+  return gMatrix.Color(pos * 3, 255 - pos * 3, 0);
+}
+
+void startMatrixTest() {
+  if (!gMatrixReady || kMatrixLedCount == 0) {
+    return;
+  }
+  gMatrixTestRunning = true;
+  gMatrixTestIndex = 0;
+  gMatrixLastStepMs = 0;
+  Serial.println("[OK] Teste da matriz iniciado.");
+}
+
+void tickMatrixTest() {
+  if (!gMatrixReady || !gMatrixTestRunning) {
+    return;
+  }
+
+  const unsigned long now = millis();
+  if (now - gMatrixLastStepMs < 55) {
+    return;
+  }
+  gMatrixLastStepMs = now;
+
+  gMatrix.clear();
+  const uint8_t wheel = static_cast<uint8_t>((gMatrixTestIndex * 255) / (kMatrixLedCount - 1));
+  gMatrix.setPixelColor(gMatrixTestIndex, colorWheel(wheel));
+  gMatrix.show();
+
+  gMatrixTestIndex++;
+  if (gMatrixTestIndex >= kMatrixLedCount) {
+    gMatrixTestRunning = false;
+    applyMatrixSolidColor(gLedColor);
+    Serial.println("[OK] Teste da matriz concluido.");
+  }
+}
+
+void initMatrix() {
+  gMatrix.begin();
+  gMatrixReady = true;
+  gMatrix.setBrightness(gMatrixBrightness);
+  gMatrix.clear();
+  gMatrix.show();
+  Serial.printf("[OK] Matriz WS2812 pronta | pin=%d | leds=%u | brilho=%u\n",
+                MATRIX_DATA_PIN,
+                static_cast<unsigned>(kMatrixLedCount),
+                gMatrixBrightness);
 }
 
 void rgbTest() {
   const RgbPinList rgbPins = buildRgbPinList();
   if (rgbPins.count == 0) {
-    Serial.println("[INFO] RGB nao detectado no variant.");
+    Serial.println("[INFO] RGB onboard nao detectado no variant.");
     return;
   }
 
@@ -173,7 +292,7 @@ void rgbTest() {
     {"APAGADO", 0, 0, 0},
   };
 
-  Serial.print("Teste RGB nos GPIOs:");
+  Serial.print("Teste RGB onboard nos GPIOs:");
   for (size_t i = 0; i < rgbPins.count; i++) {
     Serial.printf(" %d", rgbPins.pins[i]);
   }
@@ -183,7 +302,7 @@ void rgbTest() {
   for (const auto &step : steps) {
     Serial.printf("  -> %s\n", step.name);
     writeRgbAllPins(rgbPins, step.r, step.g, step.b);
-    delay(550);
+    delay(350);
   }
 }
 
@@ -299,7 +418,11 @@ String buildStateJson() {
   json += "\"b\":" + String(gLedColor.b) + ",";
   json += "\"hex\":\"" + ledHexColor() + "\",";
   json += "\"wifi\":" + String(static_cast<int>(WiFi.status())) + ",";
-  json += "\"ip\":\"" + WiFi.localIP().toString() + "\"";
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"matrix_pin\":" + String(MATRIX_DATA_PIN) + ",";
+  json += "\"matrix_count\":" + String(kMatrixLedCount) + ",";
+  json += "\"matrix_brightness\":" + String(gMatrixBrightness) + ",";
+  json += "\"matrix_test\":" + String(gMatrixTestRunning ? 1 : 0);
   json += "}";
   return json;
 }
@@ -311,52 +434,94 @@ void handleRoot() {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>ESP32 LED RGB</title>
+  <title>ESP32 RGB + Matriz</title>
   <style>
-    :root { --bg:#0f172a; --card:#111827; --text:#e5e7eb; --muted:#9ca3af; --accent:#14b8a6; }
-    body { margin:0; font-family:Segoe UI, Arial, sans-serif; color:var(--text); background:radial-gradient(circle at top,#1f2937,#0b1020 65%); }
-    .wrap { max-width:520px; margin:40px auto; padding:20px; }
-    .card { background:var(--card); border:1px solid #1f2937; border-radius:16px; padding:20px; box-shadow:0 20px 40px rgba(0,0,0,.35); }
+    :root { --bg:#0b1220; --card:#101827; --text:#e6edf7; --muted:#96a3b8; --line:#223047; }
+    * { box-sizing:border-box; }
+    body {
+      margin:0;
+      min-height:100vh;
+      font-family:Segoe UI,Arial,sans-serif;
+      color:var(--text);
+      background:radial-gradient(circle at top left,#16213b,#0a0f1a 70%);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      padding:20px;
+    }
+    .card {
+      width:min(680px,100%);
+      background:var(--card);
+      border:1px solid var(--line);
+      border-radius:16px;
+      box-shadow:0 24px 40px rgba(0,0,0,.35);
+      padding:20px;
+    }
     h1 { margin:0 0 6px; font-size:24px; }
     p { margin:0 0 14px; color:var(--muted); }
-    .row { display:flex; align-items:center; gap:10px; margin:14px 0; }
-    input[type=color] { width:120px; height:52px; border:0; background:none; padding:0; cursor:pointer; }
-    button { border:0; border-radius:10px; padding:10px 12px; cursor:pointer; background:#1f2937; color:var(--text); }
-    button:hover { background:#273449; }
-    .status { font-size:14px; color:var(--muted); margin-top:8px; }
-    .dot { width:14px; height:14px; border-radius:50%; background:#000; border:1px solid #334155; }
+    .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:12px 0; }
+    input[type=color] { width:120px; height:50px; border:0; background:none; padding:0; cursor:pointer; }
+    button {
+      border:1px solid #2b3a55;
+      border-radius:10px;
+      padding:9px 12px;
+      cursor:pointer;
+      color:var(--text);
+      background:#152238;
+    }
+    button:hover { background:#1b2d48; }
+    .status { margin-top:12px; color:var(--muted); font-size:14px; line-height:1.4; }
+    .dot { width:16px; height:16px; border-radius:50%; border:1px solid #30415f; }
+    .label { font-size:14px; color:var(--muted); min-width:130px; }
+    input[type=range] { width:min(320px,100%); }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="card">
-      <h1>ESP32 RGB</h1>
-      <p>Controle o LED da placa em tempo real.</p>
-      <div class="row">
-        <input id="picker" type="color" value="#000000">
-        <button data-color="#FF0000">Vermelho</button>
-        <button data-color="#00FF00">Verde</button>
-        <button data-color="#0000FF">Azul</button>
-        <button id="off">Desligar</button>
-      </div>
-      <div class="row">
-        <div class="dot" id="dot"></div>
-        <div class="status" id="status">Carregando...</div>
-      </div>
+  <main class="card">
+    <h1>ESP32 RGB + Matriz 8x8</h1>
+    <p>Cor controla o LED onboard e a matriz WS2812.</p>
+
+    <div class="row">
+      <input id="picker" type="color" value="#000000">
+      <button data-color="#FF0000">Vermelho</button>
+      <button data-color="#00FF00">Verde</button>
+      <button data-color="#0000FF">Azul</button>
+      <button id="off">Desligar</button>
     </div>
-  </div>
+
+    <div class="row">
+      <span class="label">Brilho da matriz</span>
+      <input id="brightness" type="range" min="0" max="255" value="32">
+      <span id="brightnessVal">32</span>
+    </div>
+
+    <div class="row">
+      <button id="matrixTest">Rodar teste da matriz</button>
+      <div class="dot" id="dot"></div>
+    </div>
+
+    <div class="status" id="status">Carregando...</div>
+  </main>
+
   <script>
     const picker = document.getElementById('picker');
     const statusEl = document.getElementById('status');
     const dot = document.getElementById('dot');
-    let timer = null;
+    const brightness = document.getElementById('brightness');
+    const brightnessVal = document.getElementById('brightnessVal');
+
+    let colorTimer = null;
+    let brightTimer = null;
 
     async function fetchState() {
       const res = await fetch('/api/state');
       const st = await res.json();
       picker.value = st.hex;
       dot.style.background = st.hex;
-      statusEl.textContent = `IP: ${st.ip} | WiFi: ${st.wifi} | Cor: ${st.hex}`;
+      brightness.value = st.matrix_brightness;
+      brightnessVal.textContent = st.matrix_brightness;
+      statusEl.textContent =
+        `IP: ${st.ip} | WiFi: ${st.wifi} | Cor: ${st.hex} | Matriz: ${st.matrix_count} leds no GPIO ${st.matrix_pin} | Brilho: ${st.matrix_brightness}`;
     }
 
     async function sendColor(hex) {
@@ -364,9 +529,20 @@ void handleRoot() {
       fetchState();
     }
 
+    async function setMatrixBrightness(value) {
+      await fetch('/api/matrix?brightness=' + encodeURIComponent(value));
+      fetchState();
+    }
+
     picker.addEventListener('input', () => {
-      clearTimeout(timer);
-      timer = setTimeout(() => sendColor(picker.value), 120);
+      clearTimeout(colorTimer);
+      colorTimer = setTimeout(() => sendColor(picker.value), 120);
+    });
+
+    brightness.addEventListener('input', () => {
+      brightnessVal.textContent = brightness.value;
+      clearTimeout(brightTimer);
+      brightTimer = setTimeout(() => setMatrixBrightness(brightness.value), 120);
     });
 
     document.querySelectorAll('button[data-color]').forEach(btn => {
@@ -374,7 +550,14 @@ void handleRoot() {
     });
 
     document.getElementById('off').addEventListener('click', () => sendColor('#000000'));
+
+    document.getElementById('matrixTest').addEventListener('click', async () => {
+      await fetch('/api/matrix?test=1');
+      fetchState();
+    });
+
     fetchState();
+    setInterval(fetchState, 2000);
   </script>
 </body>
 </html>
@@ -405,7 +588,45 @@ void handleApiLed() {
   }
 
   setLedColor(next.r, next.g, next.b);
-  saveLedColor();
+  saveSettings();
+  gWebServer.send(200, "application/json", buildStateJson());
+}
+
+void handleApiMatrix() {
+  bool changed = false;
+
+  if (gWebServer.hasArg("brightness")) {
+    const int br = constrain(gWebServer.arg("brightness").toInt(), 0, 255);
+    setMatrixBrightness(static_cast<uint8_t>(br));
+    changed = true;
+  }
+
+  if (gWebServer.hasArg("test")) {
+    if (gWebServer.arg("test") != "0") {
+      startMatrixTest();
+    }
+    changed = true;
+  }
+
+  if (gWebServer.hasArg("hex")) {
+    RgbColor next = gLedColor;
+    if (!parseHexColor(gWebServer.arg("hex"), next)) {
+      gWebServer.send(400, "application/json", "{\"error\":\"invalid_color\"}");
+      return;
+    }
+    setLedColor(next.r, next.g, next.b);
+    changed = true;
+  }
+
+  if (!changed) {
+    gWebServer.send(400, "application/json", "{\"error\":\"invalid_params\"}");
+    return;
+  }
+
+  if (gWebServer.hasArg("brightness") || gWebServer.hasArg("hex")) {
+    saveSettings();
+  }
+
   gWebServer.send(200, "application/json", buildStateJson());
 }
 
@@ -417,13 +638,16 @@ bool startWebServer() {
   gWebServer.on("/", HTTP_GET, handleRoot);
   gWebServer.on("/api/state", HTTP_GET, handleApiState);
   gWebServer.on("/api/led", HTTP_GET, handleApiLed);
+  gWebServer.on("/api/matrix", HTTP_GET, handleApiMatrix);
   gWebServer.onNotFound([]() {
     gWebServer.send(404, "text/plain", "Not found");
   });
   gWebServer.begin();
 
   Serial.println("[OK] Web server iniciado.");
-  Serial.printf("Acesse: http://%s.local ou http://%s\n", DEVICE_HOSTNAME, WiFi.localIP().toString().c_str());
+  Serial.printf("Acesse: http://%s.local ou http://%s\n",
+                DEVICE_HOSTNAME,
+                WiFi.localIP().toString().c_str());
   return true;
 }
 
@@ -443,13 +667,13 @@ void setup() {
   psramPatternTest();
   nvsCounterTest();
 
+  initMatrix();
+  loadSettings();
+
   if (connectConfiguredWifi()) {
     gMdnsStarted = startMdns();
     (void)gMdnsStarted;
-    loadLedColor();
     gWebServerStarted = startWebServer();
-  } else {
-    setLedColor(0, 0, 0);
   }
 
   Serial.println("=== FIM DIAGNOSTICO ===");
@@ -460,20 +684,23 @@ void loop() {
     gWebServer.handleClient();
   }
 
+  tickMatrixTest();
+
   static unsigned long lastPrint = 0;
   const unsigned long now = millis();
   if (now - lastPrint >= 3000) {
     lastPrint = now;
     Serial.printf(
-      "Heartbeat | uptime=%lu ms | heap=%u | psram_free=%u | wifi=%d | ip=%s | led=%s\n",
+      "Heartbeat | uptime=%lu ms | heap=%u | psram_free=%u | wifi=%d | ip=%s | led=%s | matrix_br=%u | matrix_test=%d\n",
       now,
       ESP.getFreeHeap(),
       ESP.getFreePsram(),
       static_cast<int>(WiFi.status()),
       WiFi.isConnected() ? WiFi.localIP().toString().c_str() : "0.0.0.0",
-      ledHexColor().c_str()
-    );
+      ledHexColor().c_str(),
+      gMatrixBrightness,
+      gMatrixTestRunning ? 1 : 0);
   }
 
-  delay(20);
+  delay(10);
 }
