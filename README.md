@@ -64,8 +64,8 @@ C:\Users\igorh\AppData\Local\Programs\Python\Python313\python.exe -m platformio 
 Ligacao recomendada:
 - `VCC` da matriz -> `5V` do ESP32-S3
 - `GND` da matriz -> `GND` do ESP32-S3
-- `DIN` da matriz -> `GPIO14` do ESP32-S3
-- Resistor de `330R` em serie no fio de dados (`GPIO14` -> `DIN`)
+- `DIN` da matriz -> `GPIO17` do ESP32-S3
+- Resistor de `330R` em serie no fio de dados (`GPIO17` -> `DIN`)
 - Recomendado capacitor `1000uF` entre `5V` e `GND` perto da matriz
 
 Observacao de alimentacao:

@@ -23,7 +23,7 @@
 #endif
 
 #ifndef MATRIX_DATA_PIN
-#define MATRIX_DATA_PIN 14
+#define MATRIX_DATA_PIN 17
 #endif
 
 #ifndef MATRIX_WIDTH
