@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
+#include <Update.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include "soc/soc_caps.h"
@@ -27,7 +28,7 @@
 #endif
 
 #ifndef MATRIX_WIDTH
-#define MATRIX_WIDTH 8
+#define MATRIX_WIDTH 32
 #endif
 
 #ifndef MATRIX_HEIGHT
@@ -61,6 +62,8 @@ WebServer gWebServer(80);
 Adafruit_NeoPixel gMatrix(kMatrixLedCount, MATRIX_DATA_PIN, NEO_GRB + NEO_KHZ800);
 
 RgbColor gLedColor = {0, 0, 0};
+int gMatrixDataPin = MATRIX_DATA_PIN;
+uint16_t gMatrixActiveLedCount = kMatrixLedCount;
 uint8_t gMatrixBrightness = MATRIX_BRIGHTNESS_DEFAULT;
 bool gMatrixReady = false;
 bool gMatrixTestRunning = false;
@@ -69,6 +72,10 @@ unsigned long gMatrixLastStepMs = 0;
 
 bool gMdnsStarted = false;
 bool gWebServerStarted = false;
+bool gApMode = false;
+bool gOtaHasError = false;
+String gApSsid;
+String gApPassword;
 
 int getBuiltinRgbDataPin() {
 #if defined(RGB_BUILTIN)
@@ -135,8 +142,9 @@ void applyMatrixSolidColor(const RgbColor &color) {
   }
 
   gMatrix.setBrightness(gMatrixBrightness);
+  gMatrix.clear();
   const uint32_t packed = gMatrix.Color(color.r, color.g, color.b);
-  for (uint16_t i = 0; i < kMatrixLedCount; i++) {
+  for (uint16_t i = 0; i < gMatrixActiveLedCount; i++) {
     gMatrix.setPixelColor(i, packed);
   }
   gMatrix.show();
@@ -183,6 +191,14 @@ bool parseHexColor(String hex, RgbColor &out) {
   return true;
 }
 
+bool isValidMatrixPin(int pin) {
+  return pin >= 0 && pin < static_cast<int>(SOC_GPIO_PIN_COUNT);
+}
+
+bool isValidMatrixLedCount(int count) {
+  return count > 0 && count <= static_cast<int>(kMatrixLedCount);
+}
+
 void saveSettings() {
   Preferences pref;
   if (!pref.begin("ledcfg", false)) {
@@ -192,6 +208,8 @@ void saveSettings() {
   pref.putUChar("g", gLedColor.g);
   pref.putUChar("b", gLedColor.b);
   pref.putUChar("br", gMatrixBrightness);
+  pref.putInt("mpin", gMatrixDataPin);
+  pref.putUShort("mcount", gMatrixActiveLedCount);
   pref.end();
 }
 
@@ -205,10 +223,154 @@ void loadSettings() {
   const uint8_t g = pref.getUChar("g", 0);
   const uint8_t b = pref.getUChar("b", 0);
   const uint8_t br = pref.getUChar("br", MATRIX_BRIGHTNESS_DEFAULT);
+  const int pin = pref.getInt("mpin", MATRIX_DATA_PIN);
+  const uint16_t count = pref.getUShort("mcount", kMatrixLedCount);
   pref.end();
 
+  gMatrixDataPin = isValidMatrixPin(pin) ? pin : MATRIX_DATA_PIN;
+  gMatrixActiveLedCount = isValidMatrixLedCount(count) ? count : kMatrixLedCount;
   gMatrixBrightness = br;
   setLedColor(r, g, b);
+}
+
+String jsonEscape(const String &value) {
+  String out;
+  out.reserve(value.length() + 8);
+  for (size_t i = 0; i < value.length(); i++) {
+    const char c = value.charAt(i);
+    switch (c) {
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out += c;
+        break;
+    }
+  }
+  return out;
+}
+
+void loadWifiSettings(String &ssid, String &password) {
+  ssid = "";
+  password = "";
+
+  Preferences pref;
+  if (!pref.begin("wifi", true)) {
+    return;
+  }
+  ssid = pref.getString("ssid", "");
+  password = pref.getString("pass", "");
+  pref.end();
+}
+
+void saveWifiSettings(const String &ssid, const String &password) {
+  Preferences pref;
+  if (!pref.begin("wifi", false)) {
+    return;
+  }
+  pref.putString("ssid", ssid);
+  pref.putString("pass", password);
+  pref.end();
+}
+
+void clearWifiSettings() {
+  Preferences pref;
+  if (!pref.begin("wifi", false)) {
+    return;
+  }
+  pref.remove("ssid");
+  pref.remove("pass");
+  pref.end();
+}
+
+bool connectWifiWithCredentials(const String &ssid, const String &password, unsigned long timeoutMs = 15000) {
+  if (ssid.length() == 0) {
+    return false;
+  }
+
+  Serial.printf("Conectando em Wi-Fi: %s\n", ssid.c_str());
+  WiFi.mode(gApMode ? WIFI_AP_STA : WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+  WiFi.begin(ssid.c_str(), password.c_str());
+
+  const unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs) {
+    delay(250);
+    Serial.print('.');
+  }
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("[FAIL] Wi-Fi nao conectou (status=%d)\n", static_cast<int>(WiFi.status()));
+    return false;
+  }
+
+  Serial.println("[OK] Wi-Fi conectado.");
+  Serial.printf("SSID: %s\n", WiFi.SSID().c_str());
+  Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+  return true;
+}
+
+bool connectConfiguredWifi() {
+  String storedSsid;
+  String storedPassword;
+  loadWifiSettings(storedSsid, storedPassword);
+
+  if (storedSsid.length() > 0) {
+    return connectWifiWithCredentials(storedSsid, storedPassword);
+  }
+
+  if (strlen(WIFI_SSID) == 0) {
+    Serial.println("[INFO] Wi-Fi nao configurado (sem credenciais salvas e WIFI_SSID vazio).");
+    return false;
+  }
+
+  return connectWifiWithCredentials(String(WIFI_SSID), String(WIFI_PASSWORD));
+}
+
+bool startConfigAp() {
+  if (gApMode) {
+    return true;
+  }
+
+  gApSsid = String(DEVICE_HOSTNAME) + "-setup";
+  gApPassword = "12345678";
+
+  WiFi.mode(WIFI_AP_STA);
+  if (!WiFi.softAP(gApSsid.c_str(), gApPassword.c_str())) {
+    Serial.println("[FAIL] Nao foi possivel iniciar AP de configuracao.");
+    return false;
+  }
+
+  gApMode = true;
+  Serial.printf("[OK] AP ativo: %s | senha: %s | IP: %s\n",
+                gApSsid.c_str(),
+                gApPassword.c_str(),
+                WiFi.softAPIP().toString().c_str());
+  return true;
+}
+
+void stopConfigAp() {
+  if (!gApMode) {
+    return;
+  }
+  WiFi.softAPdisconnect(true);
+  gApMode = false;
+  Serial.println("[OK] AP de configuracao desligado.");
 }
 
 uint32_t colorWheel(uint8_t pos) {
@@ -225,7 +387,7 @@ uint32_t colorWheel(uint8_t pos) {
 }
 
 void startMatrixTest() {
-  if (!gMatrixReady || kMatrixLedCount == 0) {
+  if (!gMatrixReady || gMatrixActiveLedCount == 0) {
     return;
   }
   gMatrixTestRunning = true;
@@ -246,12 +408,15 @@ void tickMatrixTest() {
   gMatrixLastStepMs = now;
 
   gMatrix.clear();
-  const uint8_t wheel = static_cast<uint8_t>((gMatrixTestIndex * 255) / (kMatrixLedCount - 1));
+  uint8_t wheel = 0;
+  if (gMatrixActiveLedCount > 1) {
+    wheel = static_cast<uint8_t>((gMatrixTestIndex * 255) / (gMatrixActiveLedCount - 1));
+  }
   gMatrix.setPixelColor(gMatrixTestIndex, colorWheel(wheel));
   gMatrix.show();
 
   gMatrixTestIndex++;
-  if (gMatrixTestIndex >= kMatrixLedCount) {
+  if (gMatrixTestIndex >= gMatrixActiveLedCount) {
     gMatrixTestRunning = false;
     applyMatrixSolidColor(gLedColor);
     Serial.println("[OK] Teste da matriz concluido.");
@@ -259,14 +424,15 @@ void tickMatrixTest() {
 }
 
 void initMatrix() {
+  gMatrix.setPin(static_cast<int16_t>(gMatrixDataPin));
   gMatrix.begin();
   gMatrixReady = true;
   gMatrix.setBrightness(gMatrixBrightness);
   gMatrix.clear();
   gMatrix.show();
   Serial.printf("[OK] Matriz WS2812 pronta | pin=%d | leds=%u | brilho=%u\n",
-                MATRIX_DATA_PIN,
-                static_cast<unsigned>(kMatrixLedCount),
+                gMatrixDataPin,
+                static_cast<unsigned>(gMatrixActiveLedCount),
                 gMatrixBrightness);
 }
 
@@ -366,38 +532,6 @@ bool nvsCounterTest() {
   return true;
 }
 
-bool connectConfiguredWifi() {
-  if (strlen(WIFI_SSID) == 0) {
-    Serial.println("[INFO] Wi-Fi nao configurado (WIFI_SSID vazio).");
-    return false;
-  }
-
-  Serial.printf("Conectando em Wi-Fi: %s\n", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.persistent(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  const unsigned long timeoutMs = 15000;
-  const unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs) {
-    delay(250);
-    Serial.print('.');
-  }
-  Serial.println();
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.printf("[FAIL] Wi-Fi nao conectou (status=%d)\n", static_cast<int>(WiFi.status()));
-    return false;
-  }
-
-  Serial.println("[OK] Wi-Fi conectado.");
-  Serial.printf("SSID: %s\n", WiFi.SSID().c_str());
-  Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
-  Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
-  return true;
-}
-
 bool startMdns() {
   if (!WiFi.isConnected()) {
     return false;
@@ -419,8 +553,15 @@ String buildStateJson() {
   json += "\"hex\":\"" + ledHexColor() + "\",";
   json += "\"wifi\":" + String(static_cast<int>(WiFi.status())) + ",";
   json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
-  json += "\"matrix_pin\":" + String(MATRIX_DATA_PIN) + ",";
-  json += "\"matrix_count\":" + String(kMatrixLedCount) + ",";
+  json += "\"sta_connected\":" + String(WiFi.isConnected() ? 1 : 0) + ",";
+  json += "\"wifi_ssid\":\"" + jsonEscape(WiFi.SSID()) + "\",";
+  json += "\"hostname\":\"" + String(DEVICE_HOSTNAME) + "\",";
+  json += "\"ap_mode\":" + String(gApMode ? 1 : 0) + ",";
+  json += "\"ap_ssid\":\"" + jsonEscape(gApSsid) + "\",";
+  json += "\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
+  json += "\"matrix_pin\":" + String(gMatrixDataPin) + ",";
+  json += "\"matrix_count\":" + String(gMatrixActiveLedCount) + ",";
+  json += "\"matrix_max_count\":" + String(kMatrixLedCount) + ",";
   json += "\"matrix_brightness\":" + String(gMatrixBrightness) + ",";
   json += "\"matrix_test\":" + String(gMatrixTestRunning ? 1 : 0);
   json += "}";
@@ -478,7 +619,7 @@ void handleRoot() {
 </head>
 <body>
   <main class="card">
-    <h1>ESP32 RGB + Matriz 8x8</h1>
+    <h1>ESP32 RGB + Matriz WS2812</h1>
     <p>Cor controla o LED onboard e a matriz WS2812.</p>
 
     <div class="row">
@@ -496,8 +637,40 @@ void handleRoot() {
     </div>
 
     <div class="row">
+      <span class="label">GPIO da matriz</span>
+      <input id="matrixPin" type="number" min="0" max="48" value="17" style="width:110px;padding:8px;border-radius:8px;border:1px solid #2b3a55;background:#0f1729;color:#e6edf7;">
+      <button id="matrixPinApply">Aplicar GPIO</button>
+    </div>
+
+    <div class="row">
+      <span class="label">Qtde LEDs</span>
+      <input id="matrixCount" type="number" min="1" max="256" value="256" style="width:110px;padding:8px;border-radius:8px;border:1px solid #2b3a55;background:#0f1729;color:#e6edf7;">
+      <button id="matrixCountApply">Aplicar LEDs</button>
+    </div>
+
+    <div class="row">
       <button id="matrixTest">Rodar teste da matriz</button>
       <div class="dot" id="dot"></div>
+    </div>
+
+    <h3>Wi-Fi</h3>
+    <div class="row">
+      <span class="label">SSID</span>
+      <input id="wifiSsid" type="text" placeholder="Nome da rede" style="flex:1;min-width:220px;padding:8px;border-radius:8px;border:1px solid #2b3a55;background:#0f1729;color:#e6edf7;">
+    </div>
+    <div class="row">
+      <span class="label">Senha</span>
+      <input id="wifiPass" type="password" placeholder="Senha da rede" style="flex:1;min-width:220px;padding:8px;border-radius:8px;border:1px solid #2b3a55;background:#0f1729;color:#e6edf7;">
+    </div>
+    <div class="row">
+      <button id="wifiSave">Salvar + Conectar</button>
+      <button id="wifiForget">Esquecer Wi-Fi</button>
+    </div>
+
+    <h3>OTA (atualizar firmware)</h3>
+    <div class="row">
+      <input id="otaFile" type="file" accept=".bin,application/octet-stream" style="flex:1;min-width:220px;">
+      <button id="otaUpload">Enviar firmware</button>
     </div>
 
     <div class="status" id="status">Carregando...</div>
@@ -509,6 +682,10 @@ void handleRoot() {
     const dot = document.getElementById('dot');
     const brightness = document.getElementById('brightness');
     const brightnessVal = document.getElementById('brightnessVal');
+    const matrixPin = document.getElementById('matrixPin');
+    const matrixCount = document.getElementById('matrixCount');
+    const wifiSsid = document.getElementById('wifiSsid');
+    const wifiPass = document.getElementById('wifiPass');
 
     let colorTimer = null;
     let brightTimer = null;
@@ -520,8 +697,12 @@ void handleRoot() {
       dot.style.background = st.hex;
       brightness.value = st.matrix_brightness;
       brightnessVal.textContent = st.matrix_brightness;
+      matrixPin.value = st.matrix_pin;
+      matrixCount.max = st.matrix_max_count;
+      matrixCount.value = st.matrix_count;
+      wifiSsid.value = st.wifi_ssid || '';
       statusEl.textContent =
-        `IP: ${st.ip} | WiFi: ${st.wifi} | Cor: ${st.hex} | Matriz: ${st.matrix_count} leds no GPIO ${st.matrix_pin} | Brilho: ${st.matrix_brightness}`;
+        `IP STA: ${st.ip} | WiFi: ${st.wifi} | AP: ${st.ap_mode ? (st.ap_ssid + ' @ ' + st.ap_ip) : 'off'} | DNS: http://${st.hostname}.local | Cor: ${st.hex} | Matriz: ${st.matrix_count}/${st.matrix_max_count} leds no GPIO ${st.matrix_pin} | Brilho: ${st.matrix_brightness}`;
     }
 
     async function sendColor(hex) {
@@ -531,6 +712,34 @@ void handleRoot() {
 
     async function setMatrixBrightness(value) {
       await fetch('/api/matrix?brightness=' + encodeURIComponent(value));
+      fetchState();
+    }
+
+    async function setMatrixPin(value) {
+      const pin = parseInt(value, 10);
+      if (Number.isNaN(pin)) {
+        alert('GPIO inválido');
+        return;
+      }
+      const res = await fetch('/api/matrix?pin=' + encodeURIComponent(pin));
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || 'Falha ao aplicar GPIO');
+      }
+      fetchState();
+    }
+
+    async function setMatrixCount(value) {
+      const count = parseInt(value, 10);
+      if (Number.isNaN(count) || count < 1) {
+        alert('Quantidade inválida');
+        return;
+      }
+      const res = await fetch('/api/matrix?count=' + encodeURIComponent(count));
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || 'Falha ao aplicar quantidade de LEDs');
+      }
       fetchState();
     }
 
@@ -556,6 +765,61 @@ void handleRoot() {
       fetchState();
     });
 
+    document.getElementById('matrixPinApply').addEventListener('click', async () => {
+      await setMatrixPin(matrixPin.value);
+    });
+
+    document.getElementById('matrixCountApply').addEventListener('click', async () => {
+      await setMatrixCount(matrixCount.value);
+    });
+
+    document.getElementById('wifiSave').addEventListener('click', async () => {
+      const ssid = wifiSsid.value.trim();
+      const pass = wifiPass.value;
+      if (!ssid) {
+        alert('Informe o SSID.');
+        return;
+      }
+      statusEl.textContent = 'Conectando no Wi-Fi... aguarde';
+      const res = await fetch('/api/wifi?ssid=' + encodeURIComponent(ssid) + '&password=' + encodeURIComponent(pass) + '&save=1');
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || 'Falha ao configurar Wi-Fi');
+      }
+      fetchState();
+    });
+
+    document.getElementById('wifiForget').addEventListener('click', async () => {
+      const res = await fetch('/api/wifi?forget=1');
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || 'Falha ao esquecer Wi-Fi');
+      }
+      fetchState();
+    });
+
+    document.getElementById('otaUpload').addEventListener('click', async () => {
+      const fileInput = document.getElementById('otaFile');
+      if (!fileInput.files || fileInput.files.length === 0) {
+        alert('Selecione um arquivo .bin');
+        return;
+      }
+
+      const form = new FormData();
+      form.append('firmware', fileInput.files[0]);
+      statusEl.textContent = 'Enviando firmware OTA...';
+
+      const res = await fetch('/api/update', { method: 'POST', body: form });
+      let data = {};
+      try { data = await res.json(); } catch (_) {}
+      if (!res.ok) {
+        alert(data.error || 'Falha no OTA');
+        statusEl.textContent = 'Falha no OTA';
+        return;
+      }
+      statusEl.textContent = 'OTA concluido. Reiniciando ESP...';
+    });
+
     fetchState();
     setInterval(fetchState, 2000);
   </script>
@@ -567,6 +831,80 @@ void handleRoot() {
 
 void handleApiState() {
   gWebServer.send(200, "application/json", buildStateJson());
+}
+
+void handleApiWifi() {
+  if (gWebServer.hasArg("forget") && gWebServer.arg("forget") != "0") {
+    clearWifiSettings();
+    WiFi.disconnect(true, true);
+    startConfigAp();
+    gMdnsStarted = false;
+    gWebServer.send(200, "application/json", "{\"ok\":true,\"forgot\":true}");
+    return;
+  }
+
+  if (!gWebServer.hasArg("ssid")) {
+    gWebServer.send(200, "application/json", buildStateJson());
+    return;
+  }
+
+  const String ssid = gWebServer.arg("ssid");
+  const String password = gWebServer.hasArg("password") ? gWebServer.arg("password") : "";
+  const bool save = !gWebServer.hasArg("save") || gWebServer.arg("save") != "0";
+
+  if (ssid.length() == 0) {
+    gWebServer.send(400, "application/json", "{\"error\":\"ssid_empty\"}");
+    return;
+  }
+
+  if (!gApMode) {
+    startConfigAp();
+  }
+
+  if (!connectWifiWithCredentials(ssid, password, 20000)) {
+    gWebServer.send(502, "application/json", "{\"error\":\"wifi_connect_failed\"}");
+    return;
+  }
+
+  if (save) {
+    saveWifiSettings(ssid, password);
+  }
+
+  if (!gMdnsStarted) {
+    gMdnsStarted = startMdns();
+  }
+
+  stopConfigAp();
+  gWebServer.send(200, "application/json", buildStateJson());
+}
+
+void handleApiUpdateFinished() {
+  if (gOtaHasError || Update.hasError()) {
+    gWebServer.send(500, "application/json", "{\"error\":\"ota_failed\"}");
+    return;
+  }
+
+  gWebServer.send(200, "application/json", "{\"ok\":true,\"message\":\"restarting\"}");
+  delay(300);
+  ESP.restart();
+}
+
+void handleApiUpdateUpload() {
+  HTTPUpload &upload = gWebServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    gOtaHasError = !Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!gOtaHasError && Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      gOtaHasError = true;
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (!gOtaHasError) {
+      gOtaHasError = !Update.end(true);
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    gOtaHasError = true;
+    Update.abort();
+  }
 }
 
 void handleApiLed() {
@@ -618,12 +956,62 @@ void handleApiMatrix() {
     changed = true;
   }
 
+  if (gWebServer.hasArg("pin")) {
+    String pinArg = gWebServer.arg("pin");
+    pinArg.trim();
+    char *endPtr = nullptr;
+    const long pinVal = strtol(pinArg.c_str(), &endPtr, 10);
+    if (endPtr == pinArg.c_str() || endPtr == nullptr || *endPtr != '\0') {
+      gWebServer.send(400, "application/json", "{\"error\":\"invalid_pin\"}");
+      return;
+    }
+
+    if (!isValidMatrixPin(static_cast<int>(pinVal))) {
+      gWebServer.send(400, "application/json", "{\"error\":\"pin_out_of_range\"}");
+      return;
+    }
+
+    gMatrixDataPin = static_cast<int>(pinVal);
+    gMatrix.setPin(static_cast<int16_t>(gMatrixDataPin));
+    gMatrix.begin();
+    gMatrixReady = true;
+    gMatrix.clear();
+    gMatrix.show();
+    if (!gMatrixTestRunning) {
+      applyMatrixSolidColor(gLedColor);
+    }
+    Serial.printf("[OK] GPIO da matriz atualizado para %d\n", gMatrixDataPin);
+    changed = true;
+  }
+
+  if (gWebServer.hasArg("count")) {
+    String countArg = gWebServer.arg("count");
+    countArg.trim();
+    char *endPtr = nullptr;
+    const long countVal = strtol(countArg.c_str(), &endPtr, 10);
+    if (endPtr == countArg.c_str() || endPtr == nullptr || *endPtr != '\0') {
+      gWebServer.send(400, "application/json", "{\"error\":\"invalid_count\"}");
+      return;
+    }
+
+    if (!isValidMatrixLedCount(static_cast<int>(countVal))) {
+      gWebServer.send(400, "application/json", "{\"error\":\"count_out_of_range\"}");
+      return;
+    }
+
+    gMatrixActiveLedCount = static_cast<uint16_t>(countVal);
+    gMatrixTestRunning = false;
+    applyMatrixSolidColor(gLedColor);
+    Serial.printf("[OK] Quantidade de LEDs da matriz atualizada para %u\n", static_cast<unsigned>(gMatrixActiveLedCount));
+    changed = true;
+  }
+
   if (!changed) {
     gWebServer.send(400, "application/json", "{\"error\":\"invalid_params\"}");
     return;
   }
 
-  if (gWebServer.hasArg("brightness") || gWebServer.hasArg("hex")) {
+  if (gWebServer.hasArg("brightness") || gWebServer.hasArg("hex") || gWebServer.hasArg("pin") || gWebServer.hasArg("count")) {
     saveSettings();
   }
 
@@ -631,23 +1019,29 @@ void handleApiMatrix() {
 }
 
 bool startWebServer() {
-  if (!WiFi.isConnected()) {
-    return false;
-  }
-
   gWebServer.on("/", HTTP_GET, handleRoot);
   gWebServer.on("/api/state", HTTP_GET, handleApiState);
   gWebServer.on("/api/led", HTTP_GET, handleApiLed);
   gWebServer.on("/api/matrix", HTTP_GET, handleApiMatrix);
+  gWebServer.on("/api/wifi", HTTP_GET, handleApiWifi);
+  gWebServer.on("/api/update", HTTP_POST, handleApiUpdateFinished, handleApiUpdateUpload);
   gWebServer.onNotFound([]() {
     gWebServer.send(404, "text/plain", "Not found");
   });
   gWebServer.begin();
 
   Serial.println("[OK] Web server iniciado.");
-  Serial.printf("Acesse: http://%s.local ou http://%s\n",
-                DEVICE_HOSTNAME,
-                WiFi.localIP().toString().c_str());
+  if (WiFi.isConnected()) {
+    Serial.printf("Acesse: http://%s.local ou http://%s\n",
+                  DEVICE_HOSTNAME,
+                  WiFi.localIP().toString().c_str());
+  }
+  if (gApMode) {
+    Serial.printf("Config AP: SSID=%s senha=%s URL=http://%s\n",
+                  gApSsid.c_str(),
+                  gApPassword.c_str(),
+                  WiFi.softAPIP().toString().c_str());
+  }
   return true;
 }
 
@@ -667,14 +1061,18 @@ void setup() {
   psramPatternTest();
   nvsCounterTest();
 
-  initMatrix();
   loadSettings();
+  initMatrix();
+  applyMatrixSolidColor(gLedColor);
 
   if (connectConfiguredWifi()) {
     gMdnsStarted = startMdns();
     (void)gMdnsStarted;
-    gWebServerStarted = startWebServer();
+  } else {
+    startConfigAp();
   }
+
+  gWebServerStarted = startWebServer();
 
   Serial.println("=== FIM DIAGNOSTICO ===");
 }
