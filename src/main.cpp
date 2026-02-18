@@ -35,11 +35,15 @@
 #define MATRIX_HEIGHT 8
 #endif
 
+#ifndef MATRIX_MAX_LEDS
+#define MATRIX_MAX_LEDS 2048
+#endif
+
 #ifndef MATRIX_BRIGHTNESS_DEFAULT
 #define MATRIX_BRIGHTNESS_DEFAULT 32
 #endif
 
-static const uint16_t kMatrixLedCount = MATRIX_WIDTH * MATRIX_HEIGHT;
+static const uint16_t kMatrixLedCount = MATRIX_MAX_LEDS;
 
 #ifdef LED_BUILTIN
 static const int kLedPin = LED_BUILTIN;
@@ -64,6 +68,7 @@ Adafruit_NeoPixel gMatrix(kMatrixLedCount, MATRIX_DATA_PIN, NEO_GRB + NEO_KHZ800
 RgbColor gLedColor = {0, 0, 0};
 int gMatrixDataPin = MATRIX_DATA_PIN;
 uint16_t gMatrixActiveLedCount = kMatrixLedCount;
+uint16_t gMatrixRuntimeMaxLedCount = kMatrixLedCount;
 uint8_t gMatrixBrightness = MATRIX_BRIGHTNESS_DEFAULT;
 bool gMatrixReady = false;
 bool gMatrixTestRunning = false;
@@ -196,7 +201,27 @@ bool isValidMatrixPin(int pin) {
 }
 
 bool isValidMatrixLedCount(int count) {
-  return count > 0 && count <= static_cast<int>(kMatrixLedCount);
+  return count > 0 && count <= static_cast<int>(gMatrixRuntimeMaxLedCount);
+}
+
+uint16_t detectRuntimeMaxLedCount() {
+  // WS2812 consome ~3 bytes por LED no buffer do NeoPixel.
+  // Reservamos heap para Wi-Fi/WebServer e calculamos um teto seguro em runtime.
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  const uint32_t reservedHeap = 32 * 1024;
+
+  if (freeHeap <= reservedHeap) {
+    return 1;
+  }
+
+  uint32_t byHeap = (freeHeap - reservedHeap) / 3;
+  if (byHeap < 1) {
+    byHeap = 1;
+  }
+  if (byHeap > kMatrixLedCount) {
+    byHeap = kMatrixLedCount;
+  }
+  return static_cast<uint16_t>(byHeap);
 }
 
 void saveSettings() {
@@ -228,7 +253,7 @@ void loadSettings() {
   pref.end();
 
   gMatrixDataPin = isValidMatrixPin(pin) ? pin : MATRIX_DATA_PIN;
-  gMatrixActiveLedCount = isValidMatrixLedCount(count) ? count : kMatrixLedCount;
+  gMatrixActiveLedCount = isValidMatrixLedCount(count) ? count : gMatrixRuntimeMaxLedCount;
   gMatrixBrightness = br;
   setLedColor(r, g, b);
 }
@@ -561,7 +586,7 @@ String buildStateJson() {
   json += "\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
   json += "\"matrix_pin\":" + String(gMatrixDataPin) + ",";
   json += "\"matrix_count\":" + String(gMatrixActiveLedCount) + ",";
-  json += "\"matrix_max_count\":" + String(kMatrixLedCount) + ",";
+  json += "\"matrix_max_count\":" + String(gMatrixRuntimeMaxLedCount) + ",";
   json += "\"matrix_brightness\":" + String(gMatrixBrightness) + ",";
   json += "\"matrix_test\":" + String(gMatrixTestRunning ? 1 : 0);
   json += "}";
@@ -1060,6 +1085,12 @@ void setup() {
   rgbTest();
   psramPatternTest();
   nvsCounterTest();
+
+  gMatrixRuntimeMaxLedCount = detectRuntimeMaxLedCount();
+  gMatrixActiveLedCount = gMatrixRuntimeMaxLedCount;
+  Serial.printf("[OK] Limite automatico de LEDs em runtime: %u (teto compilado: %u)\n",
+                static_cast<unsigned>(gMatrixRuntimeMaxLedCount),
+                static_cast<unsigned>(kMatrixLedCount));
 
   loadSettings();
   initMatrix();
