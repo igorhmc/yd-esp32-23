@@ -1,7 +1,9 @@
 #include <Adafruit_NeoPixel.h>
 #include <Arduino.h>
+#include <new>
 #include <ctype.h>
 #include <ESPmDNS.h>
+#include <esp_system.h>
 #include <Preferences.h>
 #include <Update.h>
 #include <WebServer.h>
@@ -24,16 +26,56 @@
 #define DEVICE_HOSTNAME "esp32"
 #endif
 
-#ifndef MATRIX_DATA_PIN
-#define MATRIX_DATA_PIN 17
+#ifndef MATRIX_OUTPUT_COUNT
+#define MATRIX_OUTPUT_COUNT 2
 #endif
 
-#ifndef MATRIX_WIDTH
-#define MATRIX_WIDTH 8
+#ifndef MATRIX_ACTIVE_OUTPUTS_DEFAULT
+#define MATRIX_ACTIVE_OUTPUTS_DEFAULT 2
+#endif
+
+#ifndef MATRIX_MAX_OUTPUTS
+#define MATRIX_MAX_OUTPUTS 8
+#endif
+
+#ifndef MATRIX_SEGMENT_WIDTH
+#define MATRIX_SEGMENT_WIDTH 8
 #endif
 
 #ifndef MATRIX_HEIGHT
 #define MATRIX_HEIGHT 8
+#endif
+
+#ifndef MATRIX_PIN_0
+#define MATRIX_PIN_0 14
+#endif
+
+#ifndef MATRIX_PIN_1
+#define MATRIX_PIN_1 17
+#endif
+
+#ifndef MATRIX_PIN_2
+#define MATRIX_PIN_2 4
+#endif
+
+#ifndef MATRIX_PIN_3
+#define MATRIX_PIN_3 5
+#endif
+
+#ifndef MATRIX_PIN_4
+#define MATRIX_PIN_4 6
+#endif
+
+#ifndef MATRIX_PIN_5
+#define MATRIX_PIN_5 7
+#endif
+
+#ifndef MATRIX_PIN_6
+#define MATRIX_PIN_6 15
+#endif
+
+#ifndef MATRIX_PIN_7
+#define MATRIX_PIN_7 16
 #endif
 
 #ifndef MATRIX_SERPENTINE
@@ -48,15 +90,20 @@
 #define MATRIX_Y_FLIP 0
 #endif
 
+#ifndef MATRIX_SCAN_ORDER
+#define MATRIX_SCAN_ORDER 1
+#endif
+
 #ifndef MATRIX_MAX_LEDS
-#define MATRIX_MAX_LEDS (MATRIX_WIDTH * MATRIX_HEIGHT)
+#define MATRIX_MAX_LEDS 6720
 #endif
 
 #ifndef MATRIX_BRIGHTNESS_DEFAULT
 #define MATRIX_BRIGHTNESS_DEFAULT 32
 #endif
 
-static const uint16_t kMatrixLedCount = MATRIX_MAX_LEDS;
+static const uint16_t kMatrixCompiledMaxLedCount = MATRIX_MAX_LEDS;
+static const uint16_t kMatrixDefaultLedsPerOutput = MATRIX_SEGMENT_WIDTH * MATRIX_HEIGHT;
 
 #ifdef LED_BUILTIN
 static const int kLedPin = LED_BUILTIN;
@@ -80,13 +127,39 @@ enum class ScrollDirection : uint8_t {
   Right = 1,
 };
 
+enum class MatrixScanOrder : uint8_t {
+  RowMajor = 0,
+  ColumnMajor = 1,
+};
+
 WebServer gWebServer(80);
-Adafruit_NeoPixel gMatrix(kMatrixLedCount, MATRIX_DATA_PIN, NEO_GRB + NEO_KHZ800);
+uint32_t *gMatrixBuffer[MATRIX_OUTPUT_COUNT] = {nullptr};
+Adafruit_NeoPixel *gMatrixStrips[MATRIX_OUTPUT_COUNT] = {nullptr};
+const uint8_t kMatrixDefaultPins[MATRIX_MAX_OUTPUTS] = {
+  MATRIX_PIN_0,
+  MATRIX_PIN_1,
+  MATRIX_PIN_2,
+  MATRIX_PIN_3,
+  MATRIX_PIN_4,
+  MATRIX_PIN_5,
+  MATRIX_PIN_6,
+  MATRIX_PIN_7,
+};
+static_assert(MATRIX_OUTPUT_COUNT <= MATRIX_MAX_OUTPUTS, "MATRIX_OUTPUT_COUNT exceeds MATRIX_MAX_OUTPUTS");
+uint8_t gMatrixPins[MATRIX_OUTPUT_COUNT] = {0};
+uint16_t gMatrixLedsPerOutput[MATRIX_OUTPUT_COUNT] = {0};
+uint16_t gMatrixColsPerOutput[MATRIX_OUTPUT_COUNT] = {0};
+uint16_t gMatrixXOffsets[MATRIX_OUTPUT_COUNT + 1] = {0};
+uint16_t gMatrixTotalWidth = MATRIX_OUTPUT_COUNT * MATRIX_SEGMENT_WIDTH;
+uint8_t gMatrixActiveOutputs =
+  (MATRIX_ACTIVE_OUTPUTS_DEFAULT < 1)
+    ? 1
+    : ((MATRIX_ACTIVE_OUTPUTS_DEFAULT > MATRIX_OUTPUT_COUNT) ? MATRIX_OUTPUT_COUNT : MATRIX_ACTIVE_OUTPUTS_DEFAULT);
 
 RgbColor gLedColor = {0, 0, 0};
-int gMatrixDataPin = MATRIX_DATA_PIN;
-uint16_t gMatrixActiveLedCount = kMatrixLedCount;
-uint16_t gMatrixRuntimeMaxLedCount = kMatrixLedCount;
+int gMatrixDataPin = MATRIX_PIN_0;
+uint16_t gMatrixActiveLedCount = 0;
+uint16_t gMatrixRuntimeMaxLedCount = kMatrixCompiledMaxLedCount;
 uint8_t gMatrixBrightness = MATRIX_BRIGHTNESS_DEFAULT;
 bool gMatrixReady = false;
 bool gMatrixTestRunning = false;
@@ -94,10 +167,14 @@ uint16_t gMatrixTestIndex = 0;
 unsigned long gMatrixLastStepMs = 0;
 bool gMatrixScrollRunning = false;
 String gMatrixScrollText = "HELLO";
-int16_t gMatrixScrollOffsetX = MATRIX_WIDTH;
+int16_t gMatrixScrollOffsetX = 0;
 unsigned long gMatrixScrollLastStepMs = 0;
 uint16_t gMatrixScrollStepMs = 120;
 ScrollDirection gMatrixScrollDirection = ScrollDirection::Left;
+MatrixScanOrder gMatrixScanOrder = (MATRIX_SCAN_ORDER == 0) ? MatrixScanOrder::RowMajor
+                                                            : MatrixScanOrder::ColumnMajor;
+bool gMatrixXFlip = (MATRIX_X_FLIP != 0);
+bool gMatrixYFlip = (MATRIX_Y_FLIP != 0);
 
 static const uint8_t kScrollFontHeight = 6;
 static const uint8_t kScrollGlyphWidth = 5;
@@ -112,8 +189,20 @@ bool gApMode = false;
 bool gOtaHasError = false;
 String gApSsid;
 String gApPassword;
+bool gSafeMode = false;
+String gSafeModeReason;
+bool gBootMarkedStable = false;
+
+RTC_DATA_ATTR uint32_t gBootGuardArmed = 0;
+RTC_DATA_ATTR uint32_t gBootGuardAttempts = 0;
+RTC_DATA_ATTR uint32_t gRecoveryBootToken = 0;
+static const uint32_t kBootGuardMagic = 0xB007B007;
+static const uint32_t kBootGuardThreshold = 3;
+static const unsigned long kBootGuardStableMs = 30000;
+static const uint32_t kRecoveryBootMagic = 0x5AFE1234;
 
 void renderMatrixScrollFrame();
+bool mapMatrixXY(uint16_t x, uint8_t y, uint8_t &output, uint16_t &index);
 
 int getBuiltinRgbDataPin() {
 #if defined(RGB_BUILTIN)
@@ -174,18 +263,55 @@ void applyBoardLedColor(const RgbColor &color) {
 #endif
 }
 
+uint32_t packColor(uint8_t r, uint8_t g, uint8_t b) {
+  return (static_cast<uint32_t>(r) << 16) | (static_cast<uint32_t>(g) << 8) | b;
+}
+
+void clearMatrixBuffer() {
+  for (uint8_t output = 0; output < gMatrixActiveOutputs; output++) {
+    if (gMatrixBuffer[output] == nullptr) {
+      continue;
+    }
+    for (uint16_t i = 0; i < gMatrixLedsPerOutput[output]; i++) {
+      gMatrixBuffer[output][i] = 0;
+    }
+  }
+}
+
+void showMatrix() {
+  for (uint8_t output = 0; output < gMatrixActiveOutputs; output++) {
+    Adafruit_NeoPixel *strip = gMatrixStrips[output];
+    if (strip == nullptr) {
+      continue;
+    }
+    strip->setBrightness(gMatrixBrightness);
+    if (gMatrixBuffer[output] == nullptr) {
+      continue;
+    }
+    for (uint16_t i = 0; i < gMatrixLedsPerOutput[output]; i++) {
+      strip->setPixelColor(i, gMatrixBuffer[output][i]);
+    }
+    strip->show();
+  }
+}
+
 void applyMatrixSolidColor(const RgbColor &color) {
   if (!gMatrixReady) {
     return;
   }
 
-  gMatrix.setBrightness(gMatrixBrightness);
-  gMatrix.clear();
-  const uint32_t packed = gMatrix.Color(color.r, color.g, color.b);
-  for (uint16_t i = 0; i < gMatrixActiveLedCount; i++) {
-    gMatrix.setPixelColor(i, packed);
+  clearMatrixBuffer();
+
+  const uint32_t packed = packColor(color.r, color.g, color.b);
+  for (uint8_t output = 0; output < gMatrixActiveOutputs; output++) {
+    if (gMatrixBuffer[output] == nullptr) {
+      continue;
+    }
+    for (uint16_t i = 0; i < gMatrixLedsPerOutput[output]; i++) {
+      gMatrixBuffer[output][i] = packed;
+    }
   }
-  gMatrix.show();
+  showMatrix();
 }
 
 void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
@@ -241,6 +367,10 @@ const char *scrollDirectionToString(ScrollDirection direction) {
   return direction == ScrollDirection::Right ? "right" : "left";
 }
 
+const char *matrixScanOrderToString(MatrixScanOrder order) {
+  return order == MatrixScanOrder::ColumnMajor ? "column" : "row";
+}
+
 bool parseScrollDirection(const String &value, ScrollDirection &out) {
   String dir = value;
   dir.trim();
@@ -258,30 +388,344 @@ bool parseScrollDirection(const String &value, ScrollDirection &out) {
   return false;
 }
 
+bool parseMatrixScanOrder(const String &value, MatrixScanOrder &out) {
+  String scan = value;
+  scan.trim();
+  scan.toLowerCase();
+
+  if (scan == "row" || scan == "rows" || scan == "row_major") {
+    out = MatrixScanOrder::RowMajor;
+    return true;
+  }
+  if (scan == "column" || scan == "columns" || scan == "col" || scan == "column_major") {
+    out = MatrixScanOrder::ColumnMajor;
+    return true;
+  }
+
+  return false;
+}
+
+bool parseBoolArg(const String &value, bool &out) {
+  String v = value;
+  v.trim();
+  v.toLowerCase();
+
+  if (v == "1" || v == "true" || v == "on" || v == "yes") {
+    out = true;
+    return true;
+  }
+  if (v == "0" || v == "false" || v == "off" || v == "no") {
+    out = false;
+    return true;
+  }
+  return false;
+}
+
+void applyMatrixFlips(bool xFlip, bool yFlip) {
+  gMatrixXFlip = xFlip;
+  gMatrixYFlip = yFlip;
+  if (!gMatrixReady) {
+    return;
+  }
+
+  if (gMatrixScrollRunning) {
+    renderMatrixScrollFrame();
+  } else {
+    applyMatrixSolidColor(gLedColor);
+  }
+  Serial.printf("[OK] Matrix flip updated | x=%d | y=%d\n",
+                gMatrixXFlip ? 1 : 0,
+                gMatrixYFlip ? 1 : 0);
+}
+
+void applyMatrixScanOrder(MatrixScanOrder order) {
+  gMatrixScanOrder = order;
+  if (!gMatrixReady) {
+    return;
+  }
+
+  if (gMatrixScrollRunning) {
+    renderMatrixScrollFrame();
+  } else {
+    applyMatrixSolidColor(gLedColor);
+  }
+  Serial.printf("[OK] Matrix scan mapping set to %s-major\n", matrixScanOrderToString(order));
+}
+
+const char *resetReasonToString(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:
+      return "power_on";
+    case ESP_RST_SW:
+      return "software";
+    case ESP_RST_PANIC:
+      return "panic";
+    case ESP_RST_INT_WDT:
+      return "interrupt_wdt";
+    case ESP_RST_TASK_WDT:
+      return "task_wdt";
+    case ESP_RST_WDT:
+      return "other_wdt";
+    case ESP_RST_BROWNOUT:
+      return "brownout";
+    case ESP_RST_DEEPSLEEP:
+      return "deepsleep";
+    default:
+      return "other";
+  }
+}
+
+void armBootGuard() {
+  if (gBootGuardArmed == kBootGuardMagic) {
+    gBootGuardAttempts++;
+  } else {
+    gBootGuardAttempts = 1;
+  }
+  gBootGuardArmed = kBootGuardMagic;
+}
+
+void clearBootGuard() {
+  gBootGuardArmed = 0;
+  gBootGuardAttempts = 0;
+}
+
+String matrixPinsCsv() {
+  String pins;
+  for (uint8_t i = 0; i < gMatrixActiveOutputs; i++) {
+    if (i > 0) {
+      pins += ",";
+    }
+    pins += String(gMatrixPins[i]);
+  }
+  return pins;
+}
+
+String matrixCountsCsv() {
+  String counts;
+  for (uint8_t i = 0; i < gMatrixActiveOutputs; i++) {
+    if (i > 0) {
+      counts += ",";
+    }
+    counts += String(gMatrixLedsPerOutput[i]);
+  }
+  return counts;
+}
+
+uint16_t matrixWidth() {
+  return gMatrixTotalWidth;
+}
+
+uint8_t clampActiveOutputs(int value) {
+  if (value < 1) {
+    return 1;
+  }
+  if (value > MATRIX_OUTPUT_COUNT) {
+    return MATRIX_OUTPUT_COUNT;
+  }
+  return static_cast<uint8_t>(value);
+}
+
 bool isValidMatrixPin(int pin) {
   return pin >= 0 && pin < static_cast<int>(SOC_GPIO_PIN_COUNT);
 }
 
-bool isValidMatrixLedCount(int count) {
-  return count > 0 && count <= static_cast<int>(gMatrixRuntimeMaxLedCount);
+void loadDefaultMatrixPins() {
+  for (uint8_t i = 0; i < MATRIX_OUTPUT_COUNT; i++) {
+    gMatrixPins[i] = kMatrixDefaultPins[i];
+  }
+  gMatrixDataPin = gMatrixPins[0];
+}
+
+void loadDefaultMatrixCounts() {
+  for (uint8_t i = 0; i < MATRIX_OUTPUT_COUNT; i++) {
+    gMatrixLedsPerOutput[i] = kMatrixDefaultLedsPerOutput;
+  }
+}
+
+bool matrixCountsAreValid(const uint16_t counts[MATRIX_OUTPUT_COUNT],
+                         uint8_t activeOutputs,
+                         String &errorCode) {
+  uint32_t total = 0;
+  for (uint8_t i = 0; i < activeOutputs; i++) {
+    const uint16_t count = counts[i];
+    if (count == 0) {
+      errorCode = "count_zero_not_allowed";
+      return false;
+    }
+    if ((count % MATRIX_HEIGHT) != 0) {
+      errorCode = "count_must_be_multiple_of_matrix_height";
+      return false;
+    }
+    total += count;
+  }
+
+  if (total > gMatrixRuntimeMaxLedCount) {
+    errorCode = "counts_exceed_runtime_limit";
+    return false;
+  }
+  return true;
+}
+
+bool rebuildMatrixGeometry(const uint16_t counts[MATRIX_OUTPUT_COUNT],
+                          uint8_t activeOutputs,
+                          String &errorCode) {
+  if (!matrixCountsAreValid(counts, activeOutputs, errorCode)) {
+    return false;
+  }
+
+  uint16_t x = 0;
+  uint32_t total = 0;
+  gMatrixXOffsets[0] = 0;
+  for (uint8_t i = 0; i < activeOutputs; i++) {
+    gMatrixColsPerOutput[i] = static_cast<uint16_t>(counts[i] / MATRIX_HEIGHT);
+    x = static_cast<uint16_t>(x + gMatrixColsPerOutput[i]);
+    gMatrixXOffsets[i + 1] = x;
+    total += counts[i];
+  }
+  for (uint8_t i = activeOutputs; i < MATRIX_OUTPUT_COUNT; i++) {
+    gMatrixColsPerOutput[i] = 0;
+    gMatrixXOffsets[i + 1] = x;
+  }
+
+  gMatrixTotalWidth = x;
+  gMatrixActiveLedCount = static_cast<uint16_t>(total);
+  return true;
+}
+
+bool parseMatrixCountsCsv(String csv,
+                         uint8_t expectedCount,
+                         uint16_t outCounts[MATRIX_OUTPUT_COUNT],
+                         String &errorCode) {
+  csv.trim();
+  if (csv.length() == 0) {
+    errorCode = "counts_empty";
+    return false;
+  }
+
+  uint8_t count = 0;
+  int start = 0;
+  while (start <= csv.length()) {
+    const int separator = csv.indexOf(',', start);
+    String token = (separator < 0) ? csv.substring(start) : csv.substring(start, separator);
+    token.trim();
+    if (token.length() == 0) {
+      errorCode = "invalid_counts_format";
+      return false;
+    }
+
+    char *endPtr = nullptr;
+    const long val = strtol(token.c_str(), &endPtr, 10);
+    if (endPtr == token.c_str() || endPtr == nullptr || *endPtr != '\0') {
+      errorCode = "invalid_count_value";
+      return false;
+    }
+    if (val <= 0 || val > 65535) {
+      errorCode = "count_out_of_range";
+      return false;
+    }
+    if (count >= expectedCount) {
+      errorCode = "too_many_counts";
+      return false;
+    }
+
+    outCounts[count++] = static_cast<uint16_t>(val);
+
+    if (separator < 0) {
+      break;
+    }
+    start = separator + 1;
+  }
+
+  if (count != expectedCount) {
+    errorCode = "counts_count_mismatch";
+    return false;
+  }
+  return true;
+}
+
+bool matrixPinsAreUnique(const uint8_t pins[MATRIX_OUTPUT_COUNT], uint8_t activeOutputs) {
+  for (uint8_t i = 0; i < activeOutputs; i++) {
+    for (uint8_t j = i + 1; j < activeOutputs; j++) {
+      if (pins[i] == pins[j]) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool parseMatrixPinsCsv(String csv,
+                       uint8_t expectedCount,
+                       uint8_t outPins[MATRIX_OUTPUT_COUNT],
+                       String &errorCode) {
+  csv.trim();
+  if (csv.length() == 0) {
+    errorCode = "pins_empty";
+    return false;
+  }
+
+  uint8_t count = 0;
+  int start = 0;
+  while (start <= csv.length()) {
+    const int separator = csv.indexOf(',', start);
+    String token = (separator < 0) ? csv.substring(start) : csv.substring(start, separator);
+    token.trim();
+    if (token.length() == 0) {
+      errorCode = "invalid_pins_format";
+      return false;
+    }
+
+    char *endPtr = nullptr;
+    const long pin = strtol(token.c_str(), &endPtr, 10);
+    if (endPtr == token.c_str() || endPtr == nullptr || *endPtr != '\0') {
+      errorCode = "invalid_pin_value";
+      return false;
+    }
+    if (!isValidMatrixPin(static_cast<int>(pin))) {
+      errorCode = "pin_out_of_range";
+      return false;
+    }
+    if (count >= expectedCount) {
+      errorCode = "too_many_pins";
+      return false;
+    }
+
+    outPins[count++] = static_cast<uint8_t>(pin);
+
+    if (separator < 0) {
+      break;
+    }
+    start = separator + 1;
+  }
+
+  if (count != expectedCount) {
+    errorCode = "pins_count_mismatch";
+    return false;
+  }
+  if (!matrixPinsAreUnique(outPins, expectedCount)) {
+    errorCode = "duplicate_pins";
+    return false;
+  }
+  return true;
 }
 
 uint16_t detectRuntimeMaxLedCount() {
-  // WS2812 consome ~3 bytes por LED no buffer do NeoPixel.
+  // WS2812 + buffer interno + buffer de frame: ~7-8 bytes por LED.
   // Reservamos heap para Wi-Fi/WebServer e calculamos um teto seguro em runtime.
   const uint32_t freeHeap = ESP.getFreeHeap();
-  const uint32_t reservedHeap = 32 * 1024;
+  const uint32_t reservedHeap = 48 * 1024;
+  const uint32_t minReasonable = gMatrixActiveOutputs * MATRIX_HEIGHT;
 
   if (freeHeap <= reservedHeap) {
-    return 1;
+    return static_cast<uint16_t>(minReasonable);
   }
 
-  uint32_t byHeap = (freeHeap - reservedHeap) / 3;
-  if (byHeap < 1) {
-    byHeap = 1;
+  uint32_t byHeap = (freeHeap - reservedHeap) / 8;
+  if (byHeap < minReasonable) {
+    byHeap = minReasonable;
   }
-  if (byHeap > kMatrixLedCount) {
-    byHeap = kMatrixLedCount;
+  if (byHeap > kMatrixCompiledMaxLedCount) {
+    byHeap = kMatrixCompiledMaxLedCount;
   }
   return static_cast<uint16_t>(byHeap);
 }
@@ -296,12 +740,27 @@ void saveSettings() {
   pref.putUChar("b", gLedColor.b);
   pref.putUChar("br", gMatrixBrightness);
   pref.putInt("mpin", gMatrixDataPin);
+  pref.putUChar("mout", gMatrixActiveOutputs);
+  pref.putUChar("mscan", static_cast<uint8_t>(gMatrixScanOrder));
+  pref.putUChar("mxf", gMatrixXFlip ? 1 : 0);
+  pref.putUChar("myf", gMatrixYFlip ? 1 : 0);
+  for (uint8_t i = 0; i < MATRIX_OUTPUT_COUNT; i++) {
+    char pinKey[6];
+    char countKey[6];
+    snprintf(pinKey, sizeof(pinKey), "mp%u", static_cast<unsigned>(i));
+    snprintf(countKey, sizeof(countKey), "mc%u", static_cast<unsigned>(i));
+    pref.putUChar(pinKey, gMatrixPins[i]);
+    pref.putUShort(countKey, gMatrixLedsPerOutput[i]);
+  }
   pref.putUShort("mcount", gMatrixActiveLedCount);
   pref.putUChar("msdir", static_cast<uint8_t>(gMatrixScrollDirection));
   pref.end();
 }
 
 void loadSettings() {
+  loadDefaultMatrixPins();
+  loadDefaultMatrixCounts();
+
   Preferences pref;
   if (!pref.begin("ledcfg", true)) {
     return;
@@ -311,17 +770,77 @@ void loadSettings() {
   const uint8_t g = pref.getUChar("g", 0);
   const uint8_t b = pref.getUChar("b", 0);
   const uint8_t br = pref.getUChar("br", MATRIX_BRIGHTNESS_DEFAULT);
-  const int pin = pref.getInt("mpin", MATRIX_DATA_PIN);
-  const uint16_t count = pref.getUShort("mcount", kMatrixLedCount);
+  const uint8_t activeOutputsRaw = pref.getUChar("mout", gMatrixActiveOutputs);
+  const uint16_t legacyTotalCount = pref.getUShort("mcount", 0);
   const uint8_t scrollDirRaw = pref.getUChar("msdir", static_cast<uint8_t>(ScrollDirection::Left));
+  const uint8_t scanRaw = pref.getUChar("mscan", static_cast<uint8_t>(gMatrixScanOrder));
+  const uint8_t xFlipRaw = pref.getUChar("mxf", gMatrixXFlip ? 1 : 0);
+  const uint8_t yFlipRaw = pref.getUChar("myf", gMatrixYFlip ? 1 : 0);
+
+  gMatrixActiveOutputs = clampActiveOutputs(static_cast<int>(activeOutputsRaw));
+  gMatrixRuntimeMaxLedCount = detectRuntimeMaxLedCount();
+
+  bool hasAnyPerOutputCount = false;
+  for (uint8_t i = 0; i < MATRIX_OUTPUT_COUNT; i++) {
+    char pinKey[6];
+    char countKey[6];
+    snprintf(pinKey, sizeof(pinKey), "mp%u", static_cast<unsigned>(i));
+    snprintf(countKey, sizeof(countKey), "mc%u", static_cast<unsigned>(i));
+
+    int loadedPin = kMatrixDefaultPins[i];
+    if (pref.isKey(pinKey)) {
+      loadedPin = static_cast<int>(pref.getUChar(pinKey, static_cast<uint8_t>(kMatrixDefaultPins[i])));
+    } else if (i == 0) {
+      loadedPin = pref.getInt("mpin", kMatrixDefaultPins[0]);
+    }
+
+    if (isValidMatrixPin(loadedPin)) {
+      gMatrixPins[i] = static_cast<uint8_t>(loadedPin);
+    }
+
+    if (pref.isKey(countKey)) {
+      const uint16_t loadedCount = pref.getUShort(countKey, kMatrixDefaultLedsPerOutput);
+      gMatrixLedsPerOutput[i] = loadedCount;
+      hasAnyPerOutputCount = true;
+    }
+  }
+
+  if (!hasAnyPerOutputCount && legacyTotalCount > 0) {
+    if ((legacyTotalCount % gMatrixActiveOutputs) == 0) {
+      const uint16_t each = static_cast<uint16_t>(legacyTotalCount / gMatrixActiveOutputs);
+      if ((each % MATRIX_HEIGHT) == 0) {
+        for (uint8_t i = 0; i < gMatrixActiveOutputs; i++) {
+          gMatrixLedsPerOutput[i] = each;
+        }
+      }
+    }
+  }
   pref.end();
 
-  gMatrixDataPin = isValidMatrixPin(pin) ? pin : MATRIX_DATA_PIN;
-  gMatrixActiveLedCount = isValidMatrixLedCount(count) ? count : gMatrixRuntimeMaxLedCount;
+  if (!matrixPinsAreUnique(gMatrixPins, gMatrixActiveOutputs)) {
+    loadDefaultMatrixPins();
+  } else {
+    gMatrixDataPin = gMatrixPins[0];
+  }
+
+  String geometryError;
+  if (!rebuildMatrixGeometry(gMatrixLedsPerOutput, gMatrixActiveOutputs, geometryError)) {
+    loadDefaultMatrixCounts();
+    if (!rebuildMatrixGeometry(gMatrixLedsPerOutput, gMatrixActiveOutputs, geometryError)) {
+      gMatrixActiveLedCount = gMatrixActiveOutputs * MATRIX_HEIGHT;
+      gMatrixTotalWidth = gMatrixActiveOutputs;
+    }
+  }
+
   gMatrixBrightness = br;
   gMatrixScrollDirection = (scrollDirRaw == static_cast<uint8_t>(ScrollDirection::Right))
                              ? ScrollDirection::Right
                              : ScrollDirection::Left;
+  gMatrixScanOrder = (scanRaw == static_cast<uint8_t>(MatrixScanOrder::RowMajor))
+                       ? MatrixScanOrder::RowMajor
+                       : MatrixScanOrder::ColumnMajor;
+  gMatrixXFlip = (xFlipRaw != 0);
+  gMatrixYFlip = (yFlipRaw != 0);
   setLedColor(r, g, b);
 }
 
@@ -468,38 +987,63 @@ void stopConfigAp() {
 uint32_t colorWheel(uint8_t pos) {
   pos = 255 - pos;
   if (pos < 85) {
-    return gMatrix.Color(255 - pos * 3, 0, pos * 3);
+    return packColor(255 - pos * 3, 0, pos * 3);
   }
   if (pos < 170) {
     pos -= 85;
-    return gMatrix.Color(0, pos * 3, 255 - pos * 3);
+    return packColor(0, pos * 3, 255 - pos * 3);
   }
   pos -= 170;
-  return gMatrix.Color(pos * 3, 255 - pos * 3, 0);
+  return packColor(pos * 3, 255 - pos * 3, 0);
 }
 
-bool mapMatrixXY(uint8_t x, uint8_t y, uint16_t &index) {
-  if (x >= MATRIX_WIDTH || y >= MATRIX_HEIGHT) {
+bool mapMatrixXY(uint16_t x, uint8_t y, uint8_t &output, uint16_t &index) {
+  if (matrixWidth() == 0 || x >= matrixWidth() || y >= MATRIX_HEIGHT) {
     return false;
   }
 
-  const uint8_t mappedX = MATRIX_X_FLIP ? (MATRIX_WIDTH - 1 - x) : x;
-  const uint8_t mappedY = MATRIX_Y_FLIP ? (MATRIX_HEIGHT - 1 - y) : y;
+  uint16_t mappedX = gMatrixXFlip ? (matrixWidth() - 1 - x) : x;
+  const uint8_t mappedY = gMatrixYFlip ? (MATRIX_HEIGHT - 1 - y) : y;
 
-  const uint16_t rowBase = static_cast<uint16_t>(mappedY) * MATRIX_WIDTH;
-  if (MATRIX_SERPENTINE && ((mappedY & 0x01) != 0)) {
-    index = rowBase + (MATRIX_WIDTH - 1 - mappedX);
-  } else {
-    index = rowBase + mappedX;
+  const uint32_t logical = static_cast<uint32_t>(mappedY) * matrixWidth() + mappedX;
+  if (logical >= gMatrixActiveLedCount) {
+    return false;
   }
 
-  return index < gMatrixActiveLedCount;
+  output = 0;
+  while (output < gMatrixActiveOutputs && mappedX >= gMatrixXOffsets[output + 1]) {
+    output++;
+  }
+  if (output >= gMatrixActiveOutputs) {
+    return false;
+  }
+
+  uint16_t localX = static_cast<uint16_t>(mappedX - gMatrixXOffsets[output]);
+  const uint16_t outputWidth = gMatrixColsPerOutput[output];
+  if (outputWidth == 0 || localX >= outputWidth) {
+    return false;
+  }
+
+  uint8_t localY = mappedY;
+  if (gMatrixScanOrder == MatrixScanOrder::ColumnMajor) {
+    if (MATRIX_SERPENTINE && ((localX & 0x01) != 0)) {
+      localY = MATRIX_HEIGHT - 1 - localY;
+    }
+    index = static_cast<uint16_t>(localX) * MATRIX_HEIGHT + localY;
+  } else {
+    if (MATRIX_SERPENTINE && ((localY & 0x01) != 0)) {
+      localX = outputWidth - 1 - localX;
+    }
+    index = static_cast<uint16_t>(localY) * outputWidth + localX;
+  }
+  return index < gMatrixLedsPerOutput[output];
 }
 
-void setMatrixPixel(uint8_t x, uint8_t y, uint32_t color) {
+void setMatrixPixel(uint16_t x, uint8_t y, uint32_t color) {
+  uint8_t output = 0;
   uint16_t index = 0;
-  if (mapMatrixXY(x, y, index)) {
-    gMatrix.setPixelColor(index, color);
+  if (mapMatrixXY(x, y, output, index)) {
+    gMatrixBuffer[output][index] = color;
   }
 }
 
@@ -884,11 +1428,11 @@ void drawGlyphAt(int16_t x, int16_t y, char c, uint32_t color) {
 
       const int16_t px = x + col;
       const int16_t py = y + row;
-      if (px < 0 || py < 0 || px >= MATRIX_WIDTH || py >= MATRIX_HEIGHT) {
+      if (px < 0 || py < 0 || px >= matrixWidth() || py >= MATRIX_HEIGHT) {
         continue;
       }
 
-      setMatrixPixel(static_cast<uint8_t>(px), static_cast<uint8_t>(py), color);
+      setMatrixPixel(static_cast<uint16_t>(px), static_cast<uint8_t>(py), color);
     }
   }
 }
@@ -901,11 +1445,19 @@ int16_t scrollTextPixelWidth(const String &text) {
   return static_cast<int16_t>(text.length() * (kScrollGlyphWidth + kScrollGlyphSpacing));
 }
 
+int16_t scrollLoopPeriodPx(const String &text) {
+  const int16_t textWidth = scrollTextPixelWidth(text);
+  if (textWidth <= 0) {
+    return 1;
+  }
+  return textWidth;
+}
+
 int16_t scrollStartOffsetX(ScrollDirection direction, const String &text) {
   if (direction == ScrollDirection::Right) {
     return -scrollTextPixelWidth(text);
   }
-  return MATRIX_WIDTH;
+  return matrixWidth();
 }
 
 bool buildMulticolorScrollText(const String &payload, String &outText) {
@@ -935,7 +1487,7 @@ bool buildMulticolorScrollText(const String &payload, String &outText) {
           return false;
         }
 
-        const uint32_t packed = gMatrix.Color(segmentColor.r, segmentColor.g, segmentColor.b);
+        const uint32_t packed = packColor(segmentColor.r, segmentColor.g, segmentColor.b);
         for (size_t i = 0; i < segmentText.length(); i++) {
           if (outText.length() >= kScrollTextMaxLength) {
             break;
@@ -962,23 +1514,44 @@ void renderMatrixScrollFrame() {
     return;
   }
 
-  gMatrix.setBrightness(gMatrixBrightness);
-  gMatrix.clear();
+  clearMatrixBuffer();
 
   const int16_t yOffset = MATRIX_HEIGHT > kScrollFontHeight ? (MATRIX_HEIGHT - kScrollFontHeight) / 2 : 0;
-  const uint32_t color = gMatrix.Color(gLedColor.r, gLedColor.g, gLedColor.b);
-
-  for (size_t i = 0; i < gMatrixScrollText.length(); i++) {
-    const int16_t x = gMatrixScrollOffsetX + static_cast<int16_t>(i * (kScrollGlyphWidth + kScrollGlyphSpacing));
-    if (x > (MATRIX_WIDTH - 1) || (x + kScrollGlyphWidth) < 0) {
-      continue;
-    }
-    const uint32_t glyphColor =
-      (gMatrixScrollUseCharColors && i < kScrollTextMaxLength) ? gMatrixScrollCharColors[i] : color;
-    drawGlyphAt(x, yOffset, gMatrixScrollText.charAt(i), glyphColor);
+  const uint32_t color = packColor(gLedColor.r, gLedColor.g, gLedColor.b);
+  const int16_t textWidth = scrollTextPixelWidth(gMatrixScrollText);
+  const int16_t period = scrollLoopPeriodPx(gMatrixScrollText);
+  if (textWidth <= 0 || period <= 0) {
+    showMatrix();
+    return;
   }
 
-  gMatrix.show();
+  if (gMatrixScrollDirection == ScrollDirection::Right) {
+    for (int16_t baseX = gMatrixScrollOffsetX; baseX + textWidth >= 0; baseX -= period) {
+      for (size_t i = 0; i < gMatrixScrollText.length(); i++) {
+        const int16_t x = baseX + static_cast<int16_t>(i * (kScrollGlyphWidth + kScrollGlyphSpacing));
+        if (x > (matrixWidth() - 1) || (x + kScrollGlyphWidth) < 0) {
+          continue;
+        }
+        const uint32_t glyphColor =
+          (gMatrixScrollUseCharColors && i < kScrollTextMaxLength) ? gMatrixScrollCharColors[i] : color;
+        drawGlyphAt(x, yOffset, gMatrixScrollText.charAt(i), glyphColor);
+      }
+    }
+  } else {
+    for (int16_t baseX = gMatrixScrollOffsetX; baseX < matrixWidth(); baseX += period) {
+      for (size_t i = 0; i < gMatrixScrollText.length(); i++) {
+        const int16_t x = baseX + static_cast<int16_t>(i * (kScrollGlyphWidth + kScrollGlyphSpacing));
+        if (x > (matrixWidth() - 1) || (x + kScrollGlyphWidth) < 0) {
+          continue;
+        }
+        const uint32_t glyphColor =
+          (gMatrixScrollUseCharColors && i < kScrollTextMaxLength) ? gMatrixScrollCharColors[i] : color;
+        drawGlyphAt(x, yOffset, gMatrixScrollText.charAt(i), glyphColor);
+      }
+    }
+  }
+
+  showMatrix();
 }
 
 bool startMatrixScrollCore(String text, uint16_t speedMs) {
@@ -1044,16 +1617,19 @@ void tickMatrixScroll() {
   }
   gMatrixScrollLastStepMs = now;
 
-  const int16_t textWidth = scrollTextPixelWidth(gMatrixScrollText);
+  const int16_t period = scrollLoopPeriodPx(gMatrixScrollText);
+  if (period <= 0) {
+    return;
+  }
   if (gMatrixScrollDirection == ScrollDirection::Right) {
     gMatrixScrollOffsetX++;
-    if (gMatrixScrollOffsetX > MATRIX_WIDTH) {
-      gMatrixScrollOffsetX = -textWidth;
+    if (gMatrixScrollOffsetX >= period) {
+      gMatrixScrollOffsetX -= period;
     }
   } else {
     gMatrixScrollOffsetX--;
-    if (gMatrixScrollOffsetX < -textWidth) {
-      gMatrixScrollOffsetX = MATRIX_WIDTH;
+    if (gMatrixScrollOffsetX <= -period) {
+      gMatrixScrollOffsetX += period;
     }
   }
 
@@ -1082,13 +1658,15 @@ void tickMatrixTest() {
   }
   gMatrixLastStepMs = now;
 
-  gMatrix.clear();
+  clearMatrixBuffer();
   uint8_t wheel = 0;
   if (gMatrixActiveLedCount > 1) {
     wheel = static_cast<uint8_t>((gMatrixTestIndex * 255) / (gMatrixActiveLedCount - 1));
   }
-  gMatrix.setPixelColor(gMatrixTestIndex, colorWheel(wheel));
-  gMatrix.show();
+  const uint16_t x = static_cast<uint16_t>(gMatrixTestIndex % matrixWidth());
+  const uint8_t y = static_cast<uint8_t>(gMatrixTestIndex / matrixWidth());
+  setMatrixPixel(x, y, colorWheel(wheel));
+  showMatrix();
 
   gMatrixTestIndex++;
   if (gMatrixTestIndex >= gMatrixActiveLedCount) {
@@ -1098,17 +1676,277 @@ void tickMatrixTest() {
   }
 }
 
-void initMatrix() {
-  gMatrix.setPin(static_cast<int16_t>(gMatrixDataPin));
-  gMatrix.begin();
+void releaseMatrixControllers(Adafruit_NeoPixel *controllers[MATRIX_OUTPUT_COUNT]) {
+  for (uint8_t output = 0; output < MATRIX_OUTPUT_COUNT; output++) {
+    if (controllers[output] != nullptr) {
+      controllers[output]->clear();
+      controllers[output]->show();
+      delete controllers[output];
+      controllers[output] = nullptr;
+    }
+  }
+}
+
+void releaseMatrixBuffers(uint32_t *buffers[MATRIX_OUTPUT_COUNT]) {
+  for (uint8_t output = 0; output < MATRIX_OUTPUT_COUNT; output++) {
+    if (buffers[output] != nullptr) {
+      delete[] buffers[output];
+      buffers[output] = nullptr;
+    }
+  }
+}
+
+bool createMatrixResources(const uint8_t pins[MATRIX_OUTPUT_COUNT],
+                           uint8_t activeOutputs,
+                           const uint16_t counts[MATRIX_OUTPUT_COUNT],
+                           Adafruit_NeoPixel *controllers[MATRIX_OUTPUT_COUNT],
+                           uint32_t *buffers[MATRIX_OUTPUT_COUNT]) {
+  for (uint8_t output = 0; output < MATRIX_OUTPUT_COUNT; output++) {
+    controllers[output] = nullptr;
+    buffers[output] = nullptr;
+  }
+
+  for (uint8_t output = 0; output < activeOutputs; output++) {
+    const uint8_t pin = pins[output];
+    const uint16_t ledCount = counts[output];
+    if (!isValidMatrixPin(pin)) {
+      Serial.printf("[FAIL] Invalid matrix pin on output %u: %u\n",
+                    static_cast<unsigned>(output),
+                    static_cast<unsigned>(pin));
+      releaseMatrixControllers(controllers);
+      releaseMatrixBuffers(buffers);
+      return false;
+    }
+
+    if (ledCount == 0) {
+      Serial.printf("[FAIL] Invalid LED count on output %u\n",
+                    static_cast<unsigned>(output));
+      releaseMatrixControllers(controllers);
+      releaseMatrixBuffers(buffers);
+      return false;
+    }
+
+    buffers[output] = new (std::nothrow) uint32_t[ledCount];
+    if (buffers[output] == nullptr) {
+      Serial.printf("[FAIL] Matrix buffer allocation failed on output %u (count=%u)\n",
+                    static_cast<unsigned>(output),
+                    static_cast<unsigned>(ledCount));
+      releaseMatrixControllers(controllers);
+      releaseMatrixBuffers(buffers);
+      return false;
+    }
+    for (uint16_t i = 0; i < ledCount; i++) {
+      buffers[output][i] = 0;
+    }
+
+    controllers[output] = new (std::nothrow) Adafruit_NeoPixel(
+      ledCount, pin, NEO_GRB + NEO_KHZ800);
+    if (controllers[output] == nullptr) {
+      Serial.printf("[FAIL] Matrix strip allocation failed on output %u (pin=%u)\n",
+                    static_cast<unsigned>(output),
+                    static_cast<unsigned>(pin));
+      releaseMatrixControllers(controllers);
+      releaseMatrixBuffers(buffers);
+      return false;
+    }
+
+    controllers[output]->begin();
+    controllers[output]->clear();
+    controllers[output]->show();
+  }
+
+  return true;
+}
+
+bool initMatrix() {
+  if (!matrixPinsAreUnique(gMatrixPins, gMatrixActiveOutputs)) {
+    Serial.println("[FAIL] Matrix outputs must use unique GPIO pins.");
+    gMatrixReady = false;
+    return false;
+  }
+
+  String geometryError;
+  if (!rebuildMatrixGeometry(gMatrixLedsPerOutput, gMatrixActiveOutputs, geometryError)) {
+    Serial.printf("[FAIL] Matrix geometry invalid: %s\n", geometryError.c_str());
+    gMatrixReady = false;
+    return false;
+  }
+
+  Adafruit_NeoPixel *newControllers[MATRIX_OUTPUT_COUNT] = {nullptr};
+  uint32_t *newBuffers[MATRIX_OUTPUT_COUNT] = {nullptr};
+  if (!createMatrixResources(gMatrixPins, gMatrixActiveOutputs, gMatrixLedsPerOutput, newControllers, newBuffers)) {
+    gMatrixReady = false;
+    return false;
+  }
+
+  releaseMatrixControllers(gMatrixStrips);
+  releaseMatrixBuffers(gMatrixBuffer);
+  for (uint8_t output = 0; output < MATRIX_OUTPUT_COUNT; output++) {
+    gMatrixStrips[output] = newControllers[output];
+    gMatrixBuffer[output] = newBuffers[output];
+    newControllers[output] = nullptr;
+    newBuffers[output] = nullptr;
+  }
+
+  gMatrixDataPin = gMatrixPins[0];
   gMatrixReady = true;
-  gMatrix.setBrightness(gMatrixBrightness);
-  gMatrix.clear();
-  gMatrix.show();
-  Serial.printf("[OK] Matriz WS2812 pronta | pin=%d | leds=%u | brilho=%u\n",
-                gMatrixDataPin,
+  clearMatrixBuffer();
+  showMatrix();
+  Serial.printf("[OK] Matriz WS2812 paralela pronta | outputs=%u/%u | pins=[%s] | counts=[%s] | width=%u | leds=%u | brilho=%u\n",
+                static_cast<unsigned>(gMatrixActiveOutputs),
+                static_cast<unsigned>(MATRIX_OUTPUT_COUNT),
+                matrixPinsCsv().c_str(),
+                matrixCountsCsv().c_str(),
+                static_cast<unsigned>(matrixWidth()),
                 static_cast<unsigned>(gMatrixActiveLedCount),
                 gMatrixBrightness);
+  return true;
+}
+
+bool applyMatrixPins(const uint8_t newPins[MATRIX_OUTPUT_COUNT]) {
+  if (!matrixPinsAreUnique(newPins, gMatrixActiveOutputs)) {
+    return false;
+  }
+
+  bool changed = false;
+  for (uint8_t i = 0; i < gMatrixActiveOutputs; i++) {
+    if (gMatrixPins[i] != newPins[i]) {
+      changed = true;
+      break;
+    }
+  }
+  if (!changed) {
+    return true;
+  }
+
+  uint8_t previousPins[MATRIX_OUTPUT_COUNT] = {0};
+  for (uint8_t i = 0; i < gMatrixActiveOutputs; i++) {
+    previousPins[i] = gMatrixPins[i];
+    gMatrixPins[i] = newPins[i];
+  }
+  gMatrixDataPin = gMatrixPins[0];
+
+  const bool wasScrollRunning = gMatrixScrollRunning;
+  gMatrixTestRunning = false;
+  gMatrixScrollRunning = false;
+
+  if (!initMatrix()) {
+    for (uint8_t i = 0; i < gMatrixActiveOutputs; i++) {
+      gMatrixPins[i] = previousPins[i];
+    }
+    gMatrixDataPin = gMatrixPins[0];
+    if (!initMatrix()) {
+      gMatrixReady = false;
+    }
+    return false;
+  }
+
+  if (wasScrollRunning) {
+    gMatrixScrollRunning = true;
+    gMatrixScrollOffsetX = scrollStartOffsetX(gMatrixScrollDirection, gMatrixScrollText);
+    gMatrixScrollLastStepMs = millis();
+    renderMatrixScrollFrame();
+  } else {
+    applyMatrixSolidColor(gLedColor);
+  }
+  Serial.printf("[OK] Matrix pins updated to [%s]\n", matrixPinsCsv().c_str());
+  return true;
+}
+
+bool applyMatrixCounts(const uint16_t newCounts[MATRIX_OUTPUT_COUNT]) {
+  String errorCode;
+  if (!matrixCountsAreValid(newCounts, gMatrixActiveOutputs, errorCode)) {
+    return false;
+  }
+
+  bool changed = false;
+  for (uint8_t i = 0; i < gMatrixActiveOutputs; i++) {
+    if (gMatrixLedsPerOutput[i] != newCounts[i]) {
+      changed = true;
+      break;
+    }
+  }
+  if (!changed) {
+    return true;
+  }
+
+  uint16_t previousCounts[MATRIX_OUTPUT_COUNT] = {0};
+  for (uint8_t i = 0; i < gMatrixActiveOutputs; i++) {
+    previousCounts[i] = gMatrixLedsPerOutput[i];
+    gMatrixLedsPerOutput[i] = newCounts[i];
+  }
+
+  const bool wasScrollRunning = gMatrixScrollRunning;
+  gMatrixTestRunning = false;
+  gMatrixScrollRunning = false;
+
+  if (!initMatrix()) {
+    for (uint8_t i = 0; i < gMatrixActiveOutputs; i++) {
+      gMatrixLedsPerOutput[i] = previousCounts[i];
+    }
+    if (!initMatrix()) {
+      gMatrixReady = false;
+    }
+    return false;
+  }
+
+  if (wasScrollRunning) {
+    gMatrixScrollRunning = true;
+    gMatrixScrollOffsetX = scrollStartOffsetX(gMatrixScrollDirection, gMatrixScrollText);
+    gMatrixScrollLastStepMs = millis();
+    renderMatrixScrollFrame();
+  } else {
+    applyMatrixSolidColor(gLedColor);
+  }
+  Serial.printf("[OK] Matrix LED counts updated to [%s]\n", matrixCountsCsv().c_str());
+  return true;
+}
+
+bool applyMatrixActiveOutputs(uint8_t newActiveOutputs, String &errorCode) {
+  newActiveOutputs = clampActiveOutputs(static_cast<int>(newActiveOutputs));
+  if (newActiveOutputs == gMatrixActiveOutputs) {
+    return true;
+  }
+
+  if (!matrixPinsAreUnique(gMatrixPins, newActiveOutputs)) {
+    errorCode = "duplicate_pins_for_active_outputs";
+    return false;
+  }
+  if (!matrixCountsAreValid(gMatrixLedsPerOutput, newActiveOutputs, errorCode)) {
+    return false;
+  }
+
+  const uint8_t previousActiveOutputs = gMatrixActiveOutputs;
+  gMatrixActiveOutputs = newActiveOutputs;
+  gMatrixRuntimeMaxLedCount = detectRuntimeMaxLedCount();
+
+  const bool wasScrollRunning = gMatrixScrollRunning;
+  gMatrixTestRunning = false;
+  gMatrixScrollRunning = false;
+
+  if (!initMatrix()) {
+    gMatrixActiveOutputs = previousActiveOutputs;
+    gMatrixRuntimeMaxLedCount = detectRuntimeMaxLedCount();
+    if (!initMatrix()) {
+      gMatrixReady = false;
+    }
+    errorCode = "matrix_active_outputs_apply_failed";
+    return false;
+  }
+
+  if (wasScrollRunning) {
+    gMatrixScrollRunning = true;
+    gMatrixScrollOffsetX = scrollStartOffsetX(gMatrixScrollDirection, gMatrixScrollText);
+    gMatrixScrollLastStepMs = millis();
+    renderMatrixScrollFrame();
+  } else {
+    applyMatrixSolidColor(gLedColor);
+  }
+
+  Serial.printf("[OK] Active outputs updated to %u/%u\n",
+                static_cast<unsigned>(gMatrixActiveOutputs),
+                static_cast<unsigned>(MATRIX_OUTPUT_COUNT));
+  return true;
 }
 
 void rgbTest() {
@@ -1231,10 +2069,21 @@ String buildStateJson() {
   json += "\"sta_connected\":" + String(WiFi.isConnected() ? 1 : 0) + ",";
   json += "\"wifi_ssid\":\"" + jsonEscape(WiFi.SSID()) + "\",";
   json += "\"hostname\":\"" + String(DEVICE_HOSTNAME) + "\",";
+  json += "\"safe_mode\":" + String(gSafeMode ? 1 : 0) + ",";
+  json += "\"safe_reason\":\"" + jsonEscape(gSafeModeReason) + "\",";
+  json += "\"boot_attempts\":" + String(gBootGuardAttempts) + ",";
   json += "\"ap_mode\":" + String(gApMode ? 1 : 0) + ",";
   json += "\"ap_ssid\":\"" + jsonEscape(gApSsid) + "\",";
   json += "\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
   json += "\"matrix_pin\":" + String(gMatrixDataPin) + ",";
+  json += "\"matrix_outputs\":" + String(static_cast<unsigned>(MATRIX_OUTPUT_COUNT)) + ",";
+  json += "\"matrix_active_outputs\":" + String(static_cast<unsigned>(gMatrixActiveOutputs)) + ",";
+  json += "\"matrix_pins\":\"" + matrixPinsCsv() + "\",";
+  json += "\"matrix_counts\":\"" + matrixCountsCsv() + "\",";
+  json += "\"matrix_scan\":\"" + String(matrixScanOrderToString(gMatrixScanOrder)) + "\",";
+  json += "\"matrix_x_flip\":" + String(gMatrixXFlip ? 1 : 0) + ",";
+  json += "\"matrix_y_flip\":" + String(gMatrixYFlip ? 1 : 0) + ",";
+  json += "\"matrix_width\":" + String(matrixWidth()) + ",";
   json += "\"matrix_count\":" + String(gMatrixActiveLedCount) + ",";
   json += "\"matrix_max_count\":" + String(gMatrixRuntimeMaxLedCount) + ",";
   json += "\"matrix_brightness\":" + String(gMatrixBrightness) + ",";
@@ -1317,15 +2166,35 @@ void handleRoot() {
     </div>
 
     <div class="row">
-      <span class="label">Matrix GPIO</span>
-      <input id="matrixPin" type="number" min="0" max="48" value="17" style="width:110px;padding:8px;border-radius:8px;border:1px solid #2b3a55;background:#0f1729;color:#e6edf7;">
-      <button id="matrixPinApply">Apply GPIO</button>
+      <span class="label">Matrix pins (CSV)</span>
+      <input id="matrixPins" type="text" value="14,17" placeholder="14,13" style="flex:1;min-width:220px;padding:8px;border-radius:8px;border:1px solid #2b3a55;background:#0f1729;color:#e6edf7;">
+      <button id="matrixPinsApply">Apply pins</button>
     </div>
 
     <div class="row">
-      <span class="label">LED count</span>
-      <input id="matrixCount" type="number" min="1" max="256" value="256" style="width:110px;padding:8px;border-radius:8px;border:1px solid #2b3a55;background:#0f1729;color:#e6edf7;">
-      <button id="matrixCountApply">Apply LEDs</button>
+      <span class="label">Active outputs</span>
+      <input id="matrixActiveOutputs" type="number" min="1" max="8" value="2" style="width:110px;padding:8px;border-radius:8px;border:1px solid #2b3a55;background:#0f1729;color:#e6edf7;">
+      <button id="matrixActiveOutputsApply">Apply outputs</button>
+    </div>
+
+    <div class="row">
+      <span class="label">Matrix wiring map</span>
+      <select id="matrixScan" style="padding:8px;border-radius:8px;border:1px solid #2b3a55;background:#0f1729;color:#e6edf7;">
+        <option value="column">Column serpentine</option>
+        <option value="row">Row serpentine</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <span class="label">Mirror</span>
+      <label style="display:flex;align-items:center;gap:6px;"><input id="matrixFlipX" type="checkbox"> X</label>
+      <label style="display:flex;align-items:center;gap:6px;"><input id="matrixFlipY" type="checkbox"> Y</label>
+    </div>
+
+    <div class="row">
+      <span class="label">LEDs per output</span>
+      <input id="matrixCounts" type="text" value="64,64" placeholder="64,256" style="flex:1;min-width:220px;padding:8px;border-radius:8px;border:1px solid #2b3a55;background:#0f1729;color:#e6edf7;">
+      <button id="matrixCountsApply">Apply LED counts</button>
     </div>
 
     <div class="row">
@@ -1387,6 +2256,9 @@ void handleRoot() {
       <input id="otaFile" type="file" accept=".bin,application/octet-stream" style="flex:1;min-width:220px;">
       <button id="otaUpload">Upload firmware</button>
     </div>
+    <div class="row" id="recoverRow" style="display:none;">
+      <button id="recoverBtn">Exit safe mode + reboot</button>
+    </div>
 
     <div class="status" id="status">Loading...</div>
   </main>
@@ -1397,8 +2269,15 @@ void handleRoot() {
     const dot = document.getElementById('dot');
     const brightness = document.getElementById('brightness');
     const brightnessVal = document.getElementById('brightnessVal');
-    const matrixPin = document.getElementById('matrixPin');
-    const matrixCount = document.getElementById('matrixCount');
+    const matrixPins = document.getElementById('matrixPins');
+    const matrixPinsApply = document.getElementById('matrixPinsApply');
+    const matrixActiveOutputs = document.getElementById('matrixActiveOutputs');
+    const matrixActiveOutputsApply = document.getElementById('matrixActiveOutputsApply');
+    const matrixScan = document.getElementById('matrixScan');
+    const matrixFlipX = document.getElementById('matrixFlipX');
+    const matrixFlipY = document.getElementById('matrixFlipY');
+    const matrixCounts = document.getElementById('matrixCounts');
+    const matrixCountsApply = document.getElementById('matrixCountsApply');
     const matrixText = document.getElementById('matrixText');
     const matrixScrollMode = document.getElementById('matrixScrollMode');
     const matrixScrollSpeed = document.getElementById('matrixScrollSpeed');
@@ -1407,6 +2286,8 @@ void handleRoot() {
     const segmentsPanel = document.getElementById('segmentsPanel');
     const segmentsList = document.getElementById('segmentsList');
     const addSegment = document.getElementById('addSegment');
+    const recoverRow = document.getElementById('recoverRow');
+    const recoverBtn = document.getElementById('recoverBtn');
     const wifiSsid = document.getElementById('wifiSsid');
     const wifiPass = document.getElementById('wifiPass');
 
@@ -1459,9 +2340,19 @@ void handleRoot() {
       dot.style.background = st.hex;
       brightness.value = st.matrix_brightness;
       brightnessVal.textContent = st.matrix_brightness;
-      matrixPin.value = st.matrix_pin;
-      matrixCount.max = st.matrix_max_count;
-      matrixCount.value = st.matrix_count;
+      if (document.activeElement !== matrixPins) {
+        matrixPins.value = (st.matrix_pins || String(st.matrix_pin || ''));
+      }
+      matrixActiveOutputs.max = String(st.matrix_outputs || 1);
+      if (document.activeElement !== matrixActiveOutputs) {
+        matrixActiveOutputs.value = String(st.matrix_active_outputs || 1);
+      }
+      matrixScan.value = st.matrix_scan || 'column';
+      matrixFlipX.checked = !!st.matrix_x_flip;
+      matrixFlipY.checked = !!st.matrix_y_flip;
+      if (document.activeElement !== matrixCounts) {
+        matrixCounts.value = st.matrix_counts || '';
+      }
       if (document.activeElement !== matrixText) {
         matrixText.value = st.matrix_scroll_text || '';
       }
@@ -1476,9 +2367,13 @@ void handleRoot() {
       matrixScrollSpeed.value = st.matrix_scroll_speed;
       matrixScrollSpeedVal.textContent = st.matrix_scroll_speed;
       matrixScrollDirection.value = st.matrix_scroll_direction || 'left';
+      recoverRow.style.display = st.safe_mode ? 'flex' : 'none';
       wifiSsid.value = st.wifi_ssid || '';
+      const safePrefix = st.safe_mode
+        ? `SAFE MODE (${st.safe_reason || 'unstable boot'}, attempts=${st.boot_attempts}) | `
+        : '';
       statusEl.textContent =
-        `STA IP: ${st.ip} | Wi-Fi: ${st.wifi} | AP: ${st.ap_mode ? (st.ap_ssid + ' @ ' + st.ap_ip) : 'off'} | DNS: http://${st.hostname}.local | Color: ${st.hex} | Matrix: ${st.matrix_count}/${st.matrix_max_count} LEDs on GPIO ${st.matrix_pin} | Brightness: ${st.matrix_brightness} | Scroll: ${st.matrix_scroll ? ('on "' + (st.matrix_scroll_text || '') + '" @ ' + st.matrix_scroll_speed + ' ms / ' + (st.matrix_scroll_direction || 'left') + (st.matrix_scroll_multicolor ? ' / multicolor' : ' / single')) : 'off'}`;
+        safePrefix + `STA IP: ${st.ip} | Wi-Fi: ${st.wifi} | AP: ${st.ap_mode ? (st.ap_ssid + ' @ ' + st.ap_ip) : 'off'} | DNS: http://${st.hostname}.local | Color: ${st.hex} | Matrix: ${st.matrix_count}/${st.matrix_max_count} LEDs, width=${st.matrix_width}, outputs=${st.matrix_active_outputs || 1}/${st.matrix_outputs || 1} [pins=${st.matrix_pins || st.matrix_pin}] [counts=${st.matrix_counts || '-'}] (${st.matrix_scan || 'column'} map, flipX=${st.matrix_x_flip ? 1 : 0}, flipY=${st.matrix_y_flip ? 1 : 0}) | Brightness: ${st.matrix_brightness} | Scroll: ${st.matrix_scroll ? ('on "' + (st.matrix_scroll_text || '') + '" @ ' + st.matrix_scroll_speed + ' ms / ' + (st.matrix_scroll_direction || 'left') + (st.matrix_scroll_multicolor ? ' / multicolor' : ' / single')) : 'off'}`;
     }
 
     async function sendColor(hex) {
@@ -1491,30 +2386,65 @@ void handleRoot() {
       fetchState();
     }
 
-    async function setMatrixPin(value) {
-      const pin = parseInt(value, 10);
-      if (Number.isNaN(pin)) {
-        alert('Invalid GPIO');
+    async function setMatrixPins(value) {
+      const pins = (value || '').trim();
+      if (!pins) {
+        alert('Type the GPIO list in CSV format, e.g. 14,13');
         return;
       }
-      const res = await fetch('/api/matrix?pin=' + encodeURIComponent(pin));
+      const res = await fetch('/api/matrix?pins=' + encodeURIComponent(pins));
       const data = await res.json();
       if (!res.ok) {
-        alert(data.error || 'Failed to apply GPIO');
+        alert(data.error || 'Failed to apply matrix pins');
       }
       fetchState();
     }
 
-    async function setMatrixCount(value) {
-      const count = parseInt(value, 10);
-      if (Number.isNaN(count) || count < 1) {
-        alert('Invalid LED count');
+    async function setMatrixActiveOutputs(value) {
+      const outputs = parseInt(value, 10);
+      if (Number.isNaN(outputs) || outputs < 1) {
+        alert('Invalid number of active outputs');
         return;
       }
-      const res = await fetch('/api/matrix?count=' + encodeURIComponent(count));
+      const res = await fetch('/api/matrix?active_outputs=' + encodeURIComponent(outputs));
       const data = await res.json();
       if (!res.ok) {
-        alert(data.error || 'Failed to apply LED count');
+        alert(data.error || 'Failed to apply active outputs');
+      }
+      fetchState();
+    }
+
+    async function setMatrixScan(value) {
+      const mode = (value || '').trim();
+      const res = await fetch('/api/matrix?map=' + encodeURIComponent(mode));
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || 'Failed to apply matrix mapping');
+      }
+      fetchState();
+    }
+
+    async function setMatrixFlips() {
+      const x = matrixFlipX.checked ? 1 : 0;
+      const y = matrixFlipY.checked ? 1 : 0;
+      const res = await fetch('/api/matrix?xflip=' + encodeURIComponent(x) + '&yflip=' + encodeURIComponent(y));
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || 'Failed to apply matrix mirror');
+      }
+      fetchState();
+    }
+
+    async function setMatrixCounts(value) {
+      const counts = (value || '').trim();
+      if (!counts) {
+        alert('Type the LED counts in CSV format, e.g. 64,256');
+        return;
+      }
+      const res = await fetch('/api/matrix?counts=' + encodeURIComponent(counts));
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || 'Failed to apply LED counts');
       }
       fetchState();
     }
@@ -1614,12 +2544,49 @@ void handleRoot() {
       fetchState();
     });
 
-    document.getElementById('matrixPinApply').addEventListener('click', async () => {
-      await setMatrixPin(matrixPin.value);
+    matrixCountsApply.addEventListener('click', async () => {
+      await setMatrixCounts(matrixCounts.value);
     });
 
-    document.getElementById('matrixCountApply').addEventListener('click', async () => {
-      await setMatrixCount(matrixCount.value);
+    matrixCounts.addEventListener('keydown', async ev => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        await setMatrixCounts(matrixCounts.value);
+      }
+    });
+
+    matrixPinsApply.addEventListener('click', async () => {
+      await setMatrixPins(matrixPins.value);
+    });
+
+    matrixPins.addEventListener('keydown', async ev => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        await setMatrixPins(matrixPins.value);
+      }
+    });
+
+    matrixActiveOutputsApply.addEventListener('click', async () => {
+      await setMatrixActiveOutputs(matrixActiveOutputs.value);
+    });
+
+    matrixActiveOutputs.addEventListener('keydown', async ev => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        await setMatrixActiveOutputs(matrixActiveOutputs.value);
+      }
+    });
+
+    matrixScan.addEventListener('change', async () => {
+      await setMatrixScan(matrixScan.value);
+    });
+
+    matrixFlipX.addEventListener('change', async () => {
+      await setMatrixFlips();
+    });
+
+    matrixFlipY.addEventListener('change', async () => {
+      await setMatrixFlips();
     });
 
     document.getElementById('matrixTextStart').addEventListener('click', async () => {
@@ -1677,6 +2644,11 @@ void handleRoot() {
       statusEl.textContent = 'OTA complete. Rebooting ESP...';
     });
 
+    recoverBtn.addEventListener('click', async () => {
+      statusEl.textContent = 'Clearing safe mode and rebooting...';
+      await fetch('/api/recover');
+    });
+
     fetchState();
     setInterval(fetchState, 2000);
   </script>
@@ -1688,6 +2660,16 @@ void handleRoot() {
 
 void handleApiState() {
   gWebServer.send(200, "application/json", buildStateJson());
+}
+
+void handleApiRecover() {
+  clearBootGuard();
+  gRecoveryBootToken = kRecoveryBootMagic;
+  gSafeMode = false;
+  gSafeModeReason = "";
+  gWebServer.send(200, "application/json", "{\"ok\":true,\"message\":\"restarting\"}");
+  delay(300);
+  ESP.restart();
 }
 
 void handleApiWifi() {
@@ -1788,6 +2770,11 @@ void handleApiLed() {
 }
 
 void handleApiMatrix() {
+  if (gSafeMode) {
+    gWebServer.send(503, "application/json", "{\"error\":\"safe_mode_active\"}");
+    return;
+  }
+
   bool changed = false;
   bool savePersistentSettings = false;
 
@@ -1853,7 +2840,80 @@ void handleApiMatrix() {
     changed = true;
   }
 
-  if (gWebServer.hasArg("pin")) {
+  if (gWebServer.hasArg("map")) {
+    MatrixScanOrder nextOrder = gMatrixScanOrder;
+    if (!parseMatrixScanOrder(gWebServer.arg("map"), nextOrder)) {
+      gWebServer.send(400, "application/json", "{\"error\":\"invalid_matrix_map\"}");
+      return;
+    }
+    if (nextOrder != gMatrixScanOrder) {
+      applyMatrixScanOrder(nextOrder);
+      savePersistentSettings = true;
+    }
+    changed = true;
+  }
+
+  if (gWebServer.hasArg("xflip") || gWebServer.hasArg("yflip")) {
+    bool nextXFlip = gMatrixXFlip;
+    bool nextYFlip = gMatrixYFlip;
+
+    if (gWebServer.hasArg("xflip") && !parseBoolArg(gWebServer.arg("xflip"), nextXFlip)) {
+      gWebServer.send(400, "application/json", "{\"error\":\"invalid_xflip\"}");
+      return;
+    }
+    if (gWebServer.hasArg("yflip") && !parseBoolArg(gWebServer.arg("yflip"), nextYFlip)) {
+      gWebServer.send(400, "application/json", "{\"error\":\"invalid_yflip\"}");
+      return;
+    }
+
+    if (nextXFlip != gMatrixXFlip || nextYFlip != gMatrixYFlip) {
+      applyMatrixFlips(nextXFlip, nextYFlip);
+      savePersistentSettings = true;
+    }
+    changed = true;
+  }
+
+  if (gWebServer.hasArg("active_outputs")) {
+    String outputsArg = gWebServer.arg("active_outputs");
+    outputsArg.trim();
+    char *endPtr = nullptr;
+    const long outputsVal = strtol(outputsArg.c_str(), &endPtr, 10);
+    if (endPtr == outputsArg.c_str() || endPtr == nullptr || *endPtr != '\0') {
+      gWebServer.send(400, "application/json", "{\"error\":\"invalid_active_outputs\"}");
+      return;
+    }
+    if (outputsVal < 1 || outputsVal > MATRIX_OUTPUT_COUNT) {
+      gWebServer.send(400, "application/json", "{\"error\":\"active_outputs_out_of_range\"}");
+      return;
+    }
+
+    String outputsError;
+    if (!applyMatrixActiveOutputs(static_cast<uint8_t>(outputsVal), outputsError)) {
+      if (outputsError.length() == 0) {
+        outputsError = "matrix_active_outputs_apply_failed";
+      }
+      gWebServer.send(500, "application/json", "{\"error\":\"" + outputsError + "\"}");
+      return;
+    }
+    changed = true;
+    savePersistentSettings = true;
+  }
+
+  if (gWebServer.hasArg("pins")) {
+    uint8_t nextPins[MATRIX_OUTPUT_COUNT] = {0};
+    String pinError;
+    if (!parseMatrixPinsCsv(gWebServer.arg("pins"), gMatrixActiveOutputs, nextPins, pinError)) {
+      gWebServer.send(400, "application/json", "{\"error\":\"" + pinError + "\"}");
+      return;
+    }
+
+    if (!applyMatrixPins(nextPins)) {
+      gWebServer.send(500, "application/json", "{\"error\":\"matrix_pin_apply_failed\"}");
+      return;
+    }
+    changed = true;
+    savePersistentSettings = true;
+  } else if (gWebServer.hasArg("pin")) {
     String pinArg = gWebServer.arg("pin");
     pinArg.trim();
     char *endPtr = nullptr;
@@ -1862,53 +2922,51 @@ void handleApiMatrix() {
       gWebServer.send(400, "application/json", "{\"error\":\"invalid_pin\"}");
       return;
     }
-
     if (!isValidMatrixPin(static_cast<int>(pinVal))) {
       gWebServer.send(400, "application/json", "{\"error\":\"pin_out_of_range\"}");
       return;
     }
 
-    gMatrixDataPin = static_cast<int>(pinVal);
-    gMatrix.setPin(static_cast<int16_t>(gMatrixDataPin));
-    gMatrix.begin();
-    gMatrixReady = true;
-    gMatrix.clear();
-    gMatrix.show();
-    if (gMatrixScrollRunning) {
-      renderMatrixScrollFrame();
-    } else if (!gMatrixTestRunning) {
-      applyMatrixSolidColor(gLedColor);
+    uint8_t nextPins[MATRIX_OUTPUT_COUNT] = {0};
+    for (uint8_t i = 0; i < MATRIX_OUTPUT_COUNT; i++) {
+      nextPins[i] = gMatrixPins[i];
     }
-    Serial.printf("[OK] GPIO da matriz atualizado para %d\n", gMatrixDataPin);
+    nextPins[0] = static_cast<uint8_t>(pinVal);
+
+    if (!matrixPinsAreUnique(nextPins, gMatrixActiveOutputs)) {
+      gWebServer.send(400, "application/json", "{\"error\":\"duplicate_pins\"}");
+      return;
+    }
+
+    if (!applyMatrixPins(nextPins)) {
+      gWebServer.send(500, "application/json", "{\"error\":\"matrix_pin_apply_failed\"}");
+      return;
+    }
     changed = true;
     savePersistentSettings = true;
   }
 
-  if (gWebServer.hasArg("count")) {
-    String countArg = gWebServer.arg("count");
-    countArg.trim();
-    char *endPtr = nullptr;
-    const long countVal = strtol(countArg.c_str(), &endPtr, 10);
-    if (endPtr == countArg.c_str() || endPtr == nullptr || *endPtr != '\0') {
-      gWebServer.send(400, "application/json", "{\"error\":\"invalid_count\"}");
+  if (gWebServer.hasArg("counts")) {
+    uint16_t nextCounts[MATRIX_OUTPUT_COUNT] = {0};
+    String countsError;
+    if (!parseMatrixCountsCsv(gWebServer.arg("counts"), gMatrixActiveOutputs, nextCounts, countsError)) {
+      gWebServer.send(400, "application/json", "{\"error\":\"" + countsError + "\"}");
+      return;
+    }
+    if (!matrixCountsAreValid(nextCounts, gMatrixActiveOutputs, countsError)) {
+      gWebServer.send(400, "application/json", "{\"error\":\"" + countsError + "\"}");
       return;
     }
 
-    if (!isValidMatrixLedCount(static_cast<int>(countVal))) {
-      gWebServer.send(400, "application/json", "{\"error\":\"count_out_of_range\"}");
+    if (!applyMatrixCounts(nextCounts)) {
+      gWebServer.send(500, "application/json", "{\"error\":\"matrix_counts_apply_failed\"}");
       return;
     }
-
-    gMatrixActiveLedCount = static_cast<uint16_t>(countVal);
-    gMatrixTestRunning = false;
-    if (gMatrixScrollRunning) {
-      renderMatrixScrollFrame();
-    } else {
-      applyMatrixSolidColor(gLedColor);
-    }
-    Serial.printf("[OK] Quantidade de LEDs da matriz atualizada para %u\n", static_cast<unsigned>(gMatrixActiveLedCount));
     changed = true;
     savePersistentSettings = true;
+  } else if (gWebServer.hasArg("count")) {
+    gWebServer.send(400, "application/json", "{\"error\":\"use_counts_csv\"}");
+    return;
   }
 
   const bool hasTextArg = gWebServer.hasArg("text");
@@ -1960,6 +3018,7 @@ void handleApiMatrix() {
 bool startWebServer() {
   gWebServer.on("/", HTTP_GET, handleRoot);
   gWebServer.on("/api/state", HTTP_GET, handleApiState);
+  gWebServer.on("/api/recover", HTTP_GET, handleApiRecover);
   gWebServer.on("/api/led", HTTP_GET, handleApiLed);
   gWebServer.on("/api/matrix", HTTP_GET, handleApiMatrix);
   gWebServer.on("/api/wifi", HTTP_GET, handleApiWifi);
@@ -1990,25 +3049,75 @@ void setup() {
   Serial.begin(115200);
   delay(800);
 
+  const esp_reset_reason_t resetReason = esp_reset_reason();
+  const bool recoveryBoot = (gRecoveryBootToken == kRecoveryBootMagic);
+  if (recoveryBoot) {
+    gRecoveryBootToken = 0;
+  }
+  armBootGuard();
+  Serial.printf("[BOOT] reset_reason=%s | boot_attempts=%u\n",
+                resetReasonToString(resetReason),
+                static_cast<unsigned>(gBootGuardAttempts));
+  if (recoveryBoot) {
+    Serial.println("[BOOT] Recovery boot requested (diagnostics skipped once).");
+  }
+  const bool criticalReset =
+    (resetReason == ESP_RST_BROWNOUT ||
+     resetReason == ESP_RST_PANIC ||
+     resetReason == ESP_RST_WDT ||
+     resetReason == ESP_RST_TASK_WDT ||
+     resetReason == ESP_RST_INT_WDT);
+  if (criticalReset ||
+      (gBootGuardAttempts >= kBootGuardThreshold &&
+       resetReason != ESP_RST_POWERON &&
+       resetReason != ESP_RST_DEEPSLEEP)) {
+    gSafeMode = true;
+    gSafeModeReason = resetReasonToString(resetReason);
+    Serial.printf("[SAFE] Entering safe mode (reason=%s, attempts=%u).\n",
+                  gSafeModeReason.c_str(),
+                  static_cast<unsigned>(gBootGuardAttempts));
+  }
+
 #ifdef LED_BUILTIN
   pinMode(kLedPin, OUTPUT);
 #endif
 
   Serial.println();
   printSystemInfo();
-  rgbTest();
-  psramPatternTest();
-  nvsCounterTest();
+  if (!gSafeMode && !recoveryBoot) {
+    rgbTest();
+    psramPatternTest();
+    nvsCounterTest();
+  } else {
+    Serial.println("[SAFE] Diagnostic stress tests skipped.");
+  }
 
   gMatrixRuntimeMaxLedCount = detectRuntimeMaxLedCount();
-  gMatrixActiveLedCount = gMatrixRuntimeMaxLedCount;
+  loadDefaultMatrixCounts();
+  String bootGeometryError;
+  (void)rebuildMatrixGeometry(gMatrixLedsPerOutput, gMatrixActiveOutputs, bootGeometryError);
   Serial.printf("[OK] Limite automatico de LEDs em runtime: %u (teto compilado: %u)\n",
                 static_cast<unsigned>(gMatrixRuntimeMaxLedCount),
-                static_cast<unsigned>(kMatrixLedCount));
+                static_cast<unsigned>(kMatrixCompiledMaxLedCount));
 
   loadSettings();
-  initMatrix();
-  applyMatrixSolidColor(gLedColor);
+  if (!gSafeMode) {
+    if (initMatrix()) {
+      applyMatrixSolidColor(gLedColor);
+    } else {
+      gSafeMode = true;
+      gSafeModeReason = "matrix_init_failed";
+      gMatrixReady = false;
+      gMatrixTestRunning = false;
+      gMatrixScrollRunning = false;
+      Serial.println("[SAFE] Matrix init failed, entering safe mode.");
+    }
+  } else {
+    gMatrixReady = false;
+    gMatrixTestRunning = false;
+    gMatrixScrollRunning = false;
+    Serial.println("[SAFE] Matrix output disabled for recovery.");
+  }
 
   if (connectConfiguredWifi()) {
     gMdnsStarted = startMdns();
@@ -2027,15 +3136,23 @@ void loop() {
     gWebServer.handleClient();
   }
 
-  tickMatrixScroll();
-  tickMatrixTest();
+  if (!gSafeMode) {
+    tickMatrixScroll();
+    tickMatrixTest();
+  }
 
   static unsigned long lastPrint = 0;
   const unsigned long now = millis();
+  if (!gSafeMode && !gBootMarkedStable && now >= kBootGuardStableMs) {
+    clearBootGuard();
+    gBootMarkedStable = true;
+    Serial.println("[BOOT] Marked as stable, boot guard reset.");
+  }
+
   if (now - lastPrint >= 3000) {
     lastPrint = now;
     Serial.printf(
-      "Heartbeat | uptime=%lu ms | heap=%u | psram_free=%u | wifi=%d | ip=%s | led=%s | matrix_br=%u | matrix_test=%d | matrix_scroll=%d | scroll_dir=%s\n",
+      "Heartbeat | uptime=%lu ms | heap=%u | psram_free=%u | wifi=%d | ip=%s | led=%s | matrix_br=%u | matrix_test=%d | matrix_scroll=%d | scroll_dir=%s | safe_mode=%d\n",
       now,
       ESP.getFreeHeap(),
       ESP.getFreePsram(),
@@ -2045,7 +3162,8 @@ void loop() {
       gMatrixBrightness,
       gMatrixTestRunning ? 1 : 0,
       gMatrixScrollRunning ? 1 : 0,
-      scrollDirectionToString(gMatrixScrollDirection));
+      scrollDirectionToString(gMatrixScrollDirection),
+      gSafeMode ? 1 : 0);
   }
 
   delay(10);
