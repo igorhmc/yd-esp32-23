@@ -104,6 +104,8 @@
 
 static const uint16_t kMatrixCompiledMaxLedCount = MATRIX_MAX_LEDS;
 static const uint16_t kMatrixDefaultLedsPerOutput = MATRIX_SEGMENT_WIDTH * MATRIX_HEIGHT;
+static const uint16_t kModuleLedCount64 = 64;
+static const uint16_t kModuleLedCount256 = 256;
 
 #ifdef LED_BUILTIN
 static const int kLedPin = LED_BUILTIN;
@@ -244,7 +246,7 @@ void writeRgbAllPins(const RgbPinList &list, uint8_t r, uint8_t g, uint8_t b) {
 }
 
 void applyBoardLedColor(const RgbColor &color) {
-  // Evita conflito de RMT quando a matriz WS2812 estiver ativa.
+  // Avoid RMT conflicts when the WS2812 matrix is active.
   if (gMatrixReady) {
     return;
   }
@@ -613,13 +615,92 @@ bool parseMatrixCountsCsv(String csv,
       return false;
     }
 
-    char *endPtr = nullptr;
-    const long val = strtol(token.c_str(), &endPtr, 10);
-    if (endPtr == token.c_str() || endPtr == nullptr || *endPtr != '\0') {
-      errorCode = "invalid_count_value";
-      return false;
+    // Accept plain totals (e.g. 320) or module math per output (e.g. 1x64+2x256).
+    uint32_t totalForOutput = 0;
+    int termStart = 0;
+    while (termStart <= token.length()) {
+      const int plusPos = token.indexOf('+', termStart);
+      String term = (plusPos < 0) ? token.substring(termStart) : token.substring(termStart, plusPos);
+      term.trim();
+      if (term.length() == 0) {
+        errorCode = "invalid_count_value";
+        return false;
+      }
+
+      const int xPosLower = term.indexOf('x');
+      const int xPosUpper = term.indexOf('X');
+      const int starPos = term.indexOf('*');
+      int splitPos = xPosLower;
+      if (splitPos < 0 || (xPosUpper >= 0 && xPosUpper < splitPos)) {
+        splitPos = xPosUpper;
+      }
+      if (splitPos < 0 || (starPos >= 0 && starPos < splitPos)) {
+        splitPos = starPos;
+      }
+
+      uint32_t termLeds = 0;
+      if (splitPos >= 0) {
+        String qtyText = term.substring(0, splitPos);
+        String moduleText = term.substring(splitPos + 1);
+        qtyText.trim();
+        moduleText.trim();
+        if (qtyText.length() == 0 || moduleText.length() == 0) {
+          errorCode = "invalid_module_term";
+          return false;
+        }
+
+        char *qtyEnd = nullptr;
+        const long qty = strtol(qtyText.c_str(), &qtyEnd, 10);
+        char *moduleEnd = nullptr;
+        long moduleSize = strtol(moduleText.c_str(), &moduleEnd, 10);
+        if (qtyEnd == qtyText.c_str() || qtyEnd == nullptr || *qtyEnd != '\0' || qty <= 0) {
+          errorCode = "invalid_module_term";
+          return false;
+        }
+        if (moduleEnd == moduleText.c_str() || moduleEnd == nullptr || *moduleEnd != '\0') {
+          errorCode = "invalid_module_term";
+          return false;
+        }
+        long moduleQty = qty;
+        if (moduleSize != kModuleLedCount64 && moduleSize != kModuleLedCount256) {
+          // Also accept reversed notation like 64x2 or 256*3.
+          if ((qty == kModuleLedCount64 || qty == kModuleLedCount256) && moduleSize > 0) {
+            moduleQty = moduleSize;
+            moduleSize = qty;
+          }
+        }
+        if (moduleSize != kModuleLedCount64 && moduleSize != kModuleLedCount256) {
+          errorCode = "unsupported_module_size";
+          return false;
+        }
+        termLeds = static_cast<uint32_t>(moduleQty) * static_cast<uint32_t>(moduleSize);
+      } else {
+        char *endPtr = nullptr;
+        const long val = strtol(term.c_str(), &endPtr, 10);
+        if (endPtr == term.c_str() || endPtr == nullptr || *endPtr != '\0') {
+          errorCode = "invalid_count_value";
+          return false;
+        }
+        if (val <= 0) {
+          errorCode = "count_out_of_range";
+          return false;
+        }
+        termLeds = static_cast<uint32_t>(val);
+      }
+
+      totalForOutput += termLeds;
+      if (totalForOutput > 65535) {
+        errorCode = "count_out_of_range";
+        return false;
+      }
+
+      if (plusPos < 0) {
+        break;
+      }
+      termStart = plusPos + 1;
     }
-    if (val <= 0 || val > 65535) {
+
+    if (totalForOutput == 0) {
       errorCode = "count_out_of_range";
       return false;
     }
@@ -628,7 +709,7 @@ bool parseMatrixCountsCsv(String csv,
       return false;
     }
 
-    outCounts[count++] = static_cast<uint16_t>(val);
+    outCounts[count++] = static_cast<uint16_t>(totalForOutput);
 
     if (separator < 0) {
       break;
@@ -710,8 +791,8 @@ bool parseMatrixPinsCsv(String csv,
 }
 
 uint16_t detectRuntimeMaxLedCount() {
-  // WS2812 + buffer interno + buffer de frame: ~7-8 bytes por LED.
-  // Reservamos heap para Wi-Fi/WebServer e calculamos um teto seguro em runtime.
+  // WS2812 + internal strip buffer + frame buffer: ~7-8 bytes per LED.
+  // Reserve heap for Wi-Fi/WebServer and compute a safe runtime ceiling.
   const uint32_t freeHeap = ESP.getFreeHeap();
   const uint32_t reservedHeap = 48 * 1024;
   const uint32_t minReasonable = gMatrixActiveOutputs * MATRIX_HEIGHT;
@@ -911,7 +992,7 @@ bool connectWifiWithCredentials(const String &ssid, const String &password, unsi
     return false;
   }
 
-  Serial.printf("Conectando em Wi-Fi: %s\n", ssid.c_str());
+  Serial.printf("Connecting to Wi-Fi: %s\n", ssid.c_str());
   WiFi.mode(gApMode ? WIFI_AP_STA : WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
@@ -925,11 +1006,11 @@ bool connectWifiWithCredentials(const String &ssid, const String &password, unsi
   Serial.println();
 
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.printf("[FAIL] Wi-Fi nao conectou (status=%d)\n", static_cast<int>(WiFi.status()));
+    Serial.printf("[FAIL] Wi-Fi did not connect (status=%d)\n", static_cast<int>(WiFi.status()));
     return false;
   }
 
-  Serial.println("[OK] Wi-Fi conectado.");
+  Serial.println("[OK] Wi-Fi connected.");
   Serial.printf("SSID: %s\n", WiFi.SSID().c_str());
   Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
   Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
@@ -946,7 +1027,7 @@ bool connectConfiguredWifi() {
   }
 
   if (strlen(WIFI_SSID) == 0) {
-    Serial.println("[INFO] Wi-Fi nao configurado (sem credenciais salvas e WIFI_SSID vazio).");
+    Serial.println("[INFO] Wi-Fi not configured (no saved credentials and empty WIFI_SSID).");
     return false;
   }
 
@@ -963,12 +1044,12 @@ bool startConfigAp() {
 
   WiFi.mode(WIFI_AP_STA);
   if (!WiFi.softAP(gApSsid.c_str(), gApPassword.c_str())) {
-    Serial.println("[FAIL] Nao foi possivel iniciar AP de configuracao.");
+    Serial.println("[FAIL] Could not start configuration AP.");
     return false;
   }
 
   gApMode = true;
-  Serial.printf("[OK] AP ativo: %s | senha: %s | IP: %s\n",
+  Serial.printf("[OK] AP active: %s | password: %s | IP: %s\n",
                 gApSsid.c_str(),
                 gApPassword.c_str(),
                 WiFi.softAPIP().toString().c_str());
@@ -981,7 +1062,7 @@ void stopConfigAp() {
   }
   WiFi.softAPdisconnect(true);
   gApMode = false;
-  Serial.println("[OK] AP de configuracao desligado.");
+  Serial.println("[OK] Configuration AP stopped.");
 }
 
 uint32_t colorWheel(uint8_t pos) {
@@ -1404,6 +1485,56 @@ bool loadGlyphRows(char c, uint8_t rows[kScrollFontHeight]) {
       memcpy(rows, data, kScrollFontHeight);
       return true;
     }
+    case '\\': {
+      const uint8_t data[kScrollFontHeight] = {0x10, 0x08, 0x04, 0x02, 0x01, 0x00};
+      memcpy(rows, data, kScrollFontHeight);
+      return true;
+    }
+    case '<': {
+      const uint8_t data[kScrollFontHeight] = {0x02, 0x04, 0x08, 0x04, 0x02, 0x00};
+      memcpy(rows, data, kScrollFontHeight);
+      return true;
+    }
+    case '>': {
+      const uint8_t data[kScrollFontHeight] = {0x08, 0x04, 0x02, 0x04, 0x08, 0x00};
+      memcpy(rows, data, kScrollFontHeight);
+      return true;
+    }
+    case '*': {
+      const uint8_t data[kScrollFontHeight] = {0x04, 0x15, 0x0E, 0x15, 0x04, 0x00};
+      memcpy(rows, data, kScrollFontHeight);
+      return true;
+    }
+    case '"': {
+      const uint8_t data[kScrollFontHeight] = {0x0A, 0x0A, 0x00, 0x00, 0x00, 0x00};
+      memcpy(rows, data, kScrollFontHeight);
+      return true;
+    }
+    case '\'': {
+      const uint8_t data[kScrollFontHeight] = {0x04, 0x04, 0x00, 0x00, 0x00, 0x00};
+      memcpy(rows, data, kScrollFontHeight);
+      return true;
+    }
+    case '[': {
+      const uint8_t data[kScrollFontHeight] = {0x0E, 0x08, 0x08, 0x08, 0x0E, 0x00};
+      memcpy(rows, data, kScrollFontHeight);
+      return true;
+    }
+    case ']': {
+      const uint8_t data[kScrollFontHeight] = {0x0E, 0x02, 0x02, 0x02, 0x0E, 0x00};
+      memcpy(rows, data, kScrollFontHeight);
+      return true;
+    }
+    case '@': {
+      const uint8_t data[kScrollFontHeight] = {0x0E, 0x11, 0x17, 0x15, 0x16, 0x0C};
+      memcpy(rows, data, kScrollFontHeight);
+      return true;
+    }
+    case '#': {
+      const uint8_t data[kScrollFontHeight] = {0x0A, 0x1F, 0x0A, 0x1F, 0x0A, 0x00};
+      memcpy(rows, data, kScrollFontHeight);
+      return true;
+    }
     case ' ': {
       return true;
     }
@@ -1644,7 +1775,7 @@ void startMatrixTest() {
   gMatrixTestRunning = true;
   gMatrixTestIndex = 0;
   gMatrixLastStepMs = 0;
-  Serial.println("[OK] Teste da matriz iniciado.");
+  Serial.println("[OK] Matrix test started.");
 }
 
 void tickMatrixTest() {
@@ -1672,7 +1803,7 @@ void tickMatrixTest() {
   if (gMatrixTestIndex >= gMatrixActiveLedCount) {
     gMatrixTestRunning = false;
     applyMatrixSolidColor(gLedColor);
-    Serial.println("[OK] Teste da matriz concluido.");
+    Serial.println("[OK] Matrix test completed.");
   }
 }
 
@@ -1792,7 +1923,7 @@ bool initMatrix() {
   gMatrixReady = true;
   clearMatrixBuffer();
   showMatrix();
-  Serial.printf("[OK] Matriz WS2812 paralela pronta | outputs=%u/%u | pins=[%s] | counts=[%s] | width=%u | leds=%u | brilho=%u\n",
+  Serial.printf("[OK] Parallel WS2812 matrix ready | outputs=%u/%u | pins=[%s] | counts=[%s] | width=%u | leds=%u | brightness=%u\n",
                 static_cast<unsigned>(gMatrixActiveOutputs),
                 static_cast<unsigned>(MATRIX_OUTPUT_COUNT),
                 matrixPinsCsv().c_str(),
@@ -1952,7 +2083,7 @@ bool applyMatrixActiveOutputs(uint8_t newActiveOutputs, String &errorCode) {
 void rgbTest() {
   const RgbPinList rgbPins = buildRgbPinList();
   if (rgbPins.count == 0) {
-    Serial.println("[INFO] RGB onboard nao detectado no variant.");
+    Serial.println("[INFO] Onboard RGB not detected in this variant.");
     return;
   }
 
@@ -1964,19 +2095,19 @@ void rgbTest() {
   };
 
   const ColorStep steps[] = {
-    {"VERMELHO", 24, 0, 0},
-    {"VERDE", 0, 24, 0},
-    {"AZUL", 0, 0, 24},
-    {"BRANCO", 18, 18, 18},
-    {"APAGADO", 0, 0, 0},
+    {"RED", 24, 0, 0},
+    {"GREEN", 0, 24, 0},
+    {"BLUE", 0, 0, 24},
+    {"WHITE", 18, 18, 18},
+    {"OFF", 0, 0, 0},
   };
 
-  Serial.print("Teste RGB onboard nos GPIOs:");
+  Serial.print("Onboard RGB test on GPIOs:");
   for (size_t i = 0; i < rgbPins.count; i++) {
     Serial.printf(" %d", rgbPins.pins[i]);
   }
   Serial.println();
-  Serial.println("Se nao acender, confira jumper de solda do WS2812 em IO48.");
+  Serial.println("If it does not light up, check the WS2812 solder jumper on IO48.");
 
   for (const auto &step : steps) {
     Serial.printf("  -> %s\n", step.name);
@@ -1986,7 +2117,7 @@ void rgbTest() {
 }
 
 void printSystemInfo() {
-  Serial.println("=== ESP32-S3 DIAGNOSTICO ===");
+  Serial.println("=== ESP32-S3 DIAGNOSTICS ===");
   Serial.printf("Chip Model: %s\n", ESP.getChipModel());
   Serial.printf("Chip Cores: %u\n", ESP.getChipCores());
   Serial.printf("Chip Revision: %u\n", ESP.getChipRevision());
@@ -2000,14 +2131,14 @@ void printSystemInfo() {
 bool psramPatternTest() {
   const size_t psramSize = ESP.getPsramSize();
   if (psramSize == 0) {
-    Serial.println("[FAIL] PSRAM nao detectada.");
+    Serial.println("[FAIL] PSRAM not detected.");
     return false;
   }
 
   const size_t testSize = 256 * 1024;
   uint8_t *buffer = static_cast<uint8_t *>(ps_malloc(testSize));
   if (buffer == nullptr) {
-    Serial.println("[FAIL] Nao foi possivel alocar na PSRAM.");
+    Serial.println("[FAIL] Could not allocate PSRAM buffer.");
     return false;
   }
 
@@ -2017,31 +2148,31 @@ bool psramPatternTest() {
   for (size_t i = 0; i < testSize; i++) {
     const uint8_t expected = static_cast<uint8_t>((i ^ 0xA5) & 0xFF);
     if (buffer[i] != expected) {
-      Serial.printf("[FAIL] PSRAM mismatch em %u\n", static_cast<unsigned>(i));
+      Serial.printf("[FAIL] PSRAM mismatch at %u\n", static_cast<unsigned>(i));
       free(buffer);
       return false;
     }
   }
 
   free(buffer);
-  Serial.printf("[OK] PSRAM testou %u bytes.\n", static_cast<unsigned>(testSize));
+  Serial.printf("[OK] PSRAM tested %u bytes.\n", static_cast<unsigned>(testSize));
   return true;
 }
 
 bool nvsCounterTest() {
   Preferences pref;
   if (!pref.begin("diag", false)) {
-    Serial.println("[FAIL] NVS nao abriu.");
+    Serial.println("[FAIL] NVS did not open.");
     return false;
   }
   const uint32_t boots = pref.getUInt("boots", 0) + 1;
   const bool saved = pref.putUInt("boots", boots) > 0;
   pref.end();
   if (!saved) {
-    Serial.println("[FAIL] NVS nao salvou contador.");
+    Serial.println("[FAIL] NVS did not save counter.");
     return false;
   }
-  Serial.printf("[OK] NVS contador de boots: %u\n", boots);
+  Serial.printf("[OK] NVS boot counter: %u\n", boots);
   return true;
 }
 
@@ -2050,11 +2181,11 @@ bool startMdns() {
     return false;
   }
   if (!MDNS.begin(DEVICE_HOSTNAME)) {
-    Serial.println("[FAIL] mDNS nao iniciou.");
+    Serial.println("[FAIL] mDNS did not start.");
     return false;
   }
   MDNS.addService("http", "tcp", 80);
-  Serial.printf("[OK] mDNS ativo em http://%s.local\n", DEVICE_HOSTNAME);
+  Serial.printf("[OK] mDNS active at http://%s.local\n", DEVICE_HOSTNAME);
   return true;
 }
 
@@ -2192,8 +2323,8 @@ void handleRoot() {
     </div>
 
     <div class="row">
-      <span class="label">LEDs per output</span>
-      <input id="matrixCounts" type="text" value="64,64" placeholder="64,256" style="flex:1;min-width:220px;padding:8px;border-radius:8px;border:1px solid #2b3a55;background:#0f1729;color:#e6edf7;">
+      <span class="label">LEDs/modules per output</span>
+      <input id="matrixCounts" type="text" value="64,64" placeholder="64,1x64+1x256" style="flex:1;min-width:220px;padding:8px;border-radius:8px;border:1px solid #2b3a55;background:#0f1729;color:#e6edf7;">
       <button id="matrixCountsApply">Apply LED counts</button>
     </div>
 
@@ -2438,7 +2569,7 @@ void handleRoot() {
     async function setMatrixCounts(value) {
       const counts = (value || '').trim();
       if (!counts) {
-        alert('Type the LED counts in CSV format, e.g. 64,256');
+        alert('Type CSV per output: plain totals (64,256) or modules (1x64+2x256,256)');
         return;
       }
       const res = await fetch('/api/matrix?counts=' + encodeURIComponent(counts));
@@ -3028,14 +3159,14 @@ bool startWebServer() {
   });
   gWebServer.begin();
 
-  Serial.println("[OK] Web server iniciado.");
+  Serial.println("[OK] Web server started.");
   if (WiFi.isConnected()) {
-    Serial.printf("Acesse: http://%s.local ou http://%s\n",
+    Serial.printf("Open: http://%s.local or http://%s\n",
                   DEVICE_HOSTNAME,
                   WiFi.localIP().toString().c_str());
   }
   if (gApMode) {
-    Serial.printf("Config AP: SSID=%s senha=%s URL=http://%s\n",
+    Serial.printf("Config AP: SSID=%s password=%s URL=http://%s\n",
                   gApSsid.c_str(),
                   gApPassword.c_str(),
                   WiFi.softAPIP().toString().c_str());
@@ -3096,7 +3227,7 @@ void setup() {
   loadDefaultMatrixCounts();
   String bootGeometryError;
   (void)rebuildMatrixGeometry(gMatrixLedsPerOutput, gMatrixActiveOutputs, bootGeometryError);
-  Serial.printf("[OK] Limite automatico de LEDs em runtime: %u (teto compilado: %u)\n",
+  Serial.printf("[OK] Automatic runtime LED limit: %u (compiled ceiling: %u)\n",
                 static_cast<unsigned>(gMatrixRuntimeMaxLedCount),
                 static_cast<unsigned>(kMatrixCompiledMaxLedCount));
 
@@ -3128,7 +3259,7 @@ void setup() {
 
   gWebServerStarted = startWebServer();
 
-  Serial.println("=== FIM DIAGNOSTICO ===");
+  Serial.println("=== END DIAGNOSTICS ===");
 }
 
 void loop() {
